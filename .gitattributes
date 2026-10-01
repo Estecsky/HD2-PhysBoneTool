@@ -1,0 +1,12 @@
+*.py text eol=lf
+*.md text eol=lf
+*.json text eol=lf
+*.ps1 text eol=lf
+.gitignore text eol=lf
+.gitattributes text eol=lf
+*.blend binary
+*.exe binary
+*.material binary
+*.pyd binary
+*.so binary
+*.zip binary
