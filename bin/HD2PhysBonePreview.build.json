@@ -1,0 +1,60 @@
+{
+  "schema": "HD2PhysBonePreviewBuild1",
+  "abi": 1,
+  "architecture": "x64",
+  "compiler": {
+    "compile_flags": "/nologo /std:c++20 /utf-8 /EHsc /permissive- /W4 /WX /O2 /GL /fp:precise /DUNICODE /D_UNICODE",
+    "link_flags": "/LTCG",
+    "floating_point": "precise"
+  },
+  "library": {
+    "file": "HD2PhysBonePreview.dll",
+    "sha256": "71fa21f345abeee64f6d4ac37ec7a570cf7ead0fe3028a943267979c3cc45fb2"
+  },
+  "inputs": [
+    {
+      "path": "src/math.cpp",
+      "sha256": "61fda6db3d4db5897dd92ee0be43eac499e69f84f6e0693886858273e917060f"
+    },
+    {
+      "path": "src/rig.cpp",
+      "sha256": "ec08ae4fa1659a5b1300fa662770e3e64793cc2734f34cb26b6bae46ce589734"
+    },
+    {
+      "path": "src/physics.cpp",
+      "sha256": "f234c9dc192ab9f130103e7c6aef183447376b2603552015f2bc4dba023b5e77"
+    },
+    {
+      "path": "src/physbone_v1.cpp",
+      "sha256": "cd173b45349b9a73f105af8fb501954c8e3432d828846a00c9bd04f0738af581"
+    },
+    {
+      "path": "src/preview_abi.cpp",
+      "sha256": "179fabb7b5355b75c287215c91dabf18b177fed8bc08b7e486ee1da8a949ed9e"
+    },
+    {
+      "path": "include/hd2ir/math.hpp",
+      "sha256": "71e57ad70fea39d1ef452276bda5f81ac118a7b291e8cc33d9a21001f6ab6c70"
+    },
+    {
+      "path": "include/hd2ir/rig.hpp",
+      "sha256": "b74951c4d25a40c23e0947929c2459d5cadc3a0cf73742b5469d9cc5f5824d39"
+    },
+    {
+      "path": "include/hd2ir/physics.hpp",
+      "sha256": "32422d3b7aace8963923f65ca28807811f0e7cc87b5385d338c1ac8ba5a9f70e"
+    },
+    {
+      "path": "include/hd2ir/physbone_v1.hpp",
+      "sha256": "7fed1e868bf38f2a5577ed48247939454f9811c9de8938db51dfd9024fd956b5"
+    },
+    {
+      "path": "include/hd2ir/preview_abi.h",
+      "sha256": "3a8226d1abf64afbecd467e816e8ba588a244e8c271e294d6f2848358662c81c"
+    },
+    {
+      "path": "build.ps1",
+      "sha256": "8b65814f3ca75e7e541515bd9a2bdb8914b949c53a9db62066ad2b9a8c6f0d68"
+    }
+  ]
+}

@@ -6,6 +6,5 @@
 /docs/
 /tools/
 /tests/
-THIRD_PARTY_NOTICES.md
 _build_manifest.json
-bin/HD2PhysBonePreview.build.json
+/*_updater/

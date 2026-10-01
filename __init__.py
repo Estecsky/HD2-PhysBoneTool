@@ -37,6 +37,10 @@ _old_classes = getattr(_old_physbone, "CLASSES", ()) if _old_physbone else ()
 _old_state_present = bool(
     globals().get("_REGISTERED", False)
     or globals().get("_DIRTY", False)
+    or any(
+        module is not None and module.owned_state_present()
+        for module in (globals().get("updates"), globals().get("preferences"))
+    )
     or any(_class_is_registered(cls) for cls in _old_classes)
     or (
         _old_physbone is not None
@@ -56,6 +60,8 @@ del _class_is_registered, _old_unregister, _old_physbone, _old_classes, _old_sta
 
 
 _SUBMODULE_ORDER = (
+    "updates",
+    "preferences",
     "physbone.blender",
 )
 for _module_name in _SUBMODULE_ORDER:
@@ -80,11 +86,16 @@ _DIRTY = False
 
 
 def _owned_state_present():
-    return bool(_REGISTERED or _DIRTY or physbone_blender.owned_state_present())
+    return bool(physbone_blender.owned_state_present()
+                or updates.owned_state_present() or preferences.owned_state_present())
+
+
+def _cleanup_steps():
+    return (updates.unregister, preferences.unregister, physbone_blender.unregister)
 
 
 def register():
-    """只注册 HD2 物理骨子系统。"""
+    """注册物理骨子系统及更新偏好；失败时撤销本轮已注册状态。"""
 
     global _DIRTY, _REGISTERED
     if _DIRTY:
@@ -93,13 +104,16 @@ def register():
         return
     try:
         physbone_blender.register()
+        preferences.register()
+        updates.register(bl_info)
     except Exception as exc:
         rollback_errors = []
-        try:
-            physbone_blender.unregister()
-        except Exception as rollback_exc:
-            rollback_errors.append(str(rollback_exc))
-        remaining = physbone_blender.owned_state_present()
+        for cleanup in _cleanup_steps():
+            try:
+                cleanup()
+            except Exception as rollback_exc:
+                rollback_errors.append(str(rollback_exc))
+        remaining = _owned_state_present()
         _REGISTERED = remaining
         _DIRTY = remaining
         if rollback_errors or remaining:
@@ -117,11 +131,12 @@ def unregister():
 
     global _DIRTY, _REGISTERED
     errors = []
-    try:
-        physbone_blender.unregister()
-    except Exception as exc:
-        errors.append(str(exc))
-    remaining = physbone_blender.owned_state_present()
+    for cleanup in _cleanup_steps():
+        try:
+            cleanup()
+        except Exception as exc:
+            errors.append(str(exc))
+    remaining = _owned_state_present()
     _REGISTERED = remaining
     _DIRTY = remaining
     if errors or remaining:
