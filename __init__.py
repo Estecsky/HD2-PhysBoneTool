@@ -17,7 +17,7 @@ VERSION_TEXT = _version.VERSION_TEXT
 bl_info = {
     "name": "Helldivers 2 PhysBone Tool",
     "author": "AQ-Echoo,WisA9",
-    "version": (0, 9, 0),
+    "version": (0, 9, 1),
     "blender": (4, 0, 0),
     "location": "3D View > 侧边栏 > HD2 物理骨",
     "description": "为《Helldivers 2》制作、预览并导出物理骨配置",
