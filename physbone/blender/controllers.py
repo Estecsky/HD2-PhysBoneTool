@@ -562,17 +562,8 @@ def _set_controller_identity(obj, owner, project_uuid, entity_type, entity_uuid)
 
 
 def _attach_to_owner(obj, owner, bone_name=""):
-    obj.parent = owner
-    if bone_name and owner.data.bones.get(bone_name) is not None:
-        bone = owner.data.bones[bone_name]
-        obj.parent_type = "BONE"
-        obj.parent_bone = bone_name
-        # Blender 的 Bone Parent 局部原点在骨尾；P3 controller 应停在骨头部。
-        obj.location = (0.0, -bone.length, 0.0)
-    else:
-        obj.parent_type = "OBJECT"
-        obj.parent_bone = ""
-        obj.location = (0.0, 0.0, 0.0)
+    from . import binding
+    binding.attach(obj, owner, bone_name, preserve_legacy=True)
     obj.rotation_mode = "XYZ"
     obj.rotation_euler = (0.0, 0.0, 0.0)
     obj.scale = (1.0, 1.0, 1.0)
@@ -938,7 +929,13 @@ def sync_collider_controller(owner, collider, bone_name):
             f"该碰撞体有 {len(matches)} 个编辑对象；请先执行“重建编辑对象”再修改吸附骨骼"
         )
     controller = matches[0]
+    from . import binding
+    old_bone = controller.parent_bone if controller.parent == owner else getattr(controller.constraints.get(binding.NAME), "subtarget", "")
+    if not binding.matches(controller, owner, old_bone):
+        raise ownership.HD2PBError("碰撞体跟随绑定损坏；请先重建编辑对象")
     state = {
+        "follow": (controller.constraints.get("HD2PB · 骨架跟随").subtarget
+                   if controller.constraints.get("HD2PB · 骨架跟随") else None),
         "parent": controller.parent,
         "parent_type": controller.parent_type,
         "parent_bone": controller.parent_bone,
@@ -966,6 +963,13 @@ def sync_collider_controller(owner, collider, bone_name):
             aspects=(preview.ASPECT_GEOMETRY,),
         )
     except Exception:
+        from . import binding
+        if state["follow"] is not None:
+            binding.attach(controller, owner, state["follow"])
+        else:
+            follow = controller.constraints.get(binding.NAME)
+            if follow is not None:
+                controller.constraints.remove(follow)
         controller.parent = state["parent"]
         controller.parent_type = state["parent_type"]
         controller.parent_bone = state["parent_bone"]

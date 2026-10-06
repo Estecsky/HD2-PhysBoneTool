@@ -15,7 +15,7 @@ GN_OWNER_VALUE = "HD2PhysBone"
 GN_SCHEMA_KEY = "hd2pb_preview_gn_schema"
 GN_KIND_KEY = "hd2pb_preview_gn_kind"
 GN_SIGNATURE_KEY = "hd2pb_preview_gn_signature"
-GN_VERSION = 12
+GN_VERSION = 13
 
 SOCKET_GEOMETRY = "Geometry"
 SOCKET_MATERIAL = "Material"
@@ -165,6 +165,11 @@ def _build_chain(group):
     curve_mesh.location = (-80, 40)
     _link(group, set_radius, "Curve", curve_mesh, "Curve")
     _link(group, profile, "Curve", curve_mesh, "Profile Curve")
+    # Newer Blender nodes use an explicit profile Scale instead of implicitly
+    # reading the curve's radius. Without this link our unit profile becomes a
+    # one-unit tube. Older nodes still consume Set Curve Radius above.
+    if curve_mesh.inputs.get("Scale") is not None:
+        _link(group, group_input, "Radius", curve_mesh, "Scale")
     _material_output(
         group,
         curve_mesh,
@@ -451,10 +456,13 @@ def is_migratable_node_group(group, kind=None):
 
 
 def _group_is_complete(group, kind):
+    # Blender translates default node names when "New Data" translation is on.
+    # Keep the ownership/signature checks, but identify I/O by stable RNA types
+    # so existing localized groups can be reused without renaming or rebuilding.
     return bool(
         is_owned_node_group(group, kind)
-        and group.nodes.get("Group Input")
-        and group.nodes.get("Group Output")
+        and any(node.bl_idname == "NodeGroupInput" for node in group.nodes)
+        and any(node.bl_idname == "NodeGroupOutput" for node in group.nodes)
     )
 
 
@@ -526,21 +534,32 @@ def set_modifier_inputs(modifier, values):
         identifier = socket_identifier(group, name)
         if not identifier:
             continue
-        try:
-            current = modifier.get(identifier, None)
-            if current == value:
-                continue
-            modifier[identifier] = value
-            changed = True
-        except (TypeError, ValueError, AttributeError):
-            # A missing optional socket should not break canonical edits.
+        current = modifier_input_value(modifier, identifier)
+        if current == value:
             continue
+        interface = getattr(modifier, "properties", None)
+        inputs = getattr(interface, "inputs", None)
+        if inputs is not None:
+            getattr(inputs, identifier).value = value
+        else:
+            modifier[identifier] = value
+        changed = True
     # IDProperty assignment alone does not invalidate the evaluated GN mesh
     # in Blender 4.0: the socket changes while a sphere keeps its old radius.
     # Tag only this modifier's owner, and only after a real value change.
     # Do not rebuild/recompile the shared node-group interface on every drag.
     if changed:
         modifier.id_data.update_tag(refresh={"DATA"})
+
+
+def modifier_input_value(modifier, identifier):
+    """Blender 5.2 moved GN inputs from modifier IDProperties to RNA values."""
+    interface = getattr(modifier, "properties", None)
+    inputs = getattr(interface, "inputs", None)
+    if inputs is not None:
+        socket = getattr(inputs, identifier, None)
+        return getattr(socket, "value", None)
+    return modifier.get(identifier, None)
 
 
 def material_socket_values(modifier):
@@ -554,7 +573,7 @@ def material_socket_values(modifier):
         if socket.socket_type != "NodeSocketMaterial":
             continue
         try:
-            value = modifier.get(socket.identifier, None)
+            value = modifier_input_value(modifier, socket.identifier)
         except (AttributeError, TypeError, ValueError):
             value = None
         if isinstance(value, bpy.types.Material):

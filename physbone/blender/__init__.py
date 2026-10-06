@@ -11,6 +11,7 @@ _MODULE_ORDER = (
     "blender_lifecycle",
     "pose_driver_properties",
     "properties",
+    "binding",
     "ownership",
     "preview_geometry",
     "preview_nodes",
@@ -22,6 +23,10 @@ _MODULE_ORDER = (
     "motion_preview",
     "pose_overlay",
     "operators",
+    "diagnostics",
+    "authoring_ui_ops",
+    "collider_transform",
+    "chain_profile_ops",
     "rest_pose",
     "ui_sidebar",
     "ui_object",
@@ -37,7 +42,7 @@ for _module_name in _MODULE_ORDER:
 del _module_name, _module
 
 
-RUNTIME_CLASSES = operators.CLASSES + pose_drivers.CLASSES + motion_preview.CLASSES + ui_sidebar.CLASSES + ui_object.CLASSES
+RUNTIME_CLASSES = operators.CLASSES + authoring_ui_ops.CLASSES + collider_transform.CLASSES + chain_profile_ops.CLASSES + pose_drivers.CLASSES + motion_preview.CLASSES + ui_sidebar.CLASSES + ui_object.CLASSES
 CLASSES = properties.CLASSES + RUNTIME_CLASSES
 
 _REGISTERED_CLASSES = []
@@ -70,7 +75,7 @@ def owned_state_present():
 
 
 def register():
-    """按 RNA → preview runtime → classes → File Export 顺序事务注册 P4。"""
+    """按 RNA → preview runtime → classes → File Export 顺序事务注册。"""
 
     global _DIRTY, _MENU_REGISTERED, _REGISTERED
     if _DIRTY:

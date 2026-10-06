@@ -23,6 +23,15 @@ _PRESET_ENUM_ROWS = []
 _PRESET_ENUM_STRING_POOL = []
 _TYPED_PRESET_ENUM_CACHE = {}
 _TYPED_PRESET_ENUM_NUMBERS = {}
+_NODE_APPLY_MODES = (
+    ("NUMERIC", "仅数值（保留目标方向）", "保留限制轴与参考方向；不兼容的限制类型会拒绝，不自动改方向"),
+    ("ALL", "包含方向", "复制全部节点参数；方向属于父骨局部坐标，不做跨骨坐标换算"),
+    ("DIRECTION", "仅方向", "仅复制限制轴与参考模式／方向／坐标架，其他参数保持不变"),
+)
+_CHAIN_SCOPES = (
+    ("CURRENT", "当前骨链／节点", "只修改当前实体"),
+    ("SELECTED_CHAINS", "选中的同项目骨链", "仅明确选中的骨链；不包含其他项目，不把空选区当作全部"),
+)
 
 
 def clear_runtime_state():
@@ -35,14 +44,20 @@ def clear_runtime_state():
     _PRESET_ENUM_STRING_POOL.clear()
     _TYPED_PRESET_ENUM_CACHE.clear()
     _TYPED_PRESET_ENUM_NUMBERS.clear()
+    from . import diagnostics, chain_profile_ops
+    diagnostics.clear()
+    chain_profile_ops.clear_runtime_state()
 
 
 def runtime_state_present():
+    from . import diagnostics, chain_profile_ops
     return bool(
         _PARAMETER_CLIPBOARD is not None
         or _PRESET_ENUM_ROWS
         or _PRESET_ENUM_STRING_POOL
         or _TYPED_PRESET_ENUM_CACHE
+        or diagnostics.present()
+        or chain_profile_ops.runtime_state_present()
     )
 
 
@@ -505,13 +520,13 @@ def _remember_navigation_after_commit(operator, context, owner):
 
 
 class HD2PB_OT_initialize_project(Operator):
-    """在单用户骨架（Armature）上建立 P3 权威项目和默认参数配置。"""
+    """在单用户骨架（Armature）上建立权威项目和默认参数配置。"""
 
     bl_idname = "hd2pb.initialize_project"
     bl_label = "初始化物理骨项目"
     bl_description = (
         "在当前单用户骨架数据（Armature datablock）上创建物理骨项目和默认弹簧参数配置，并生成可在 "
-        "大纲视图（Outliner）选择的锁定空对象（Empty）；不会修改骨骼、权重或网格"
+        "大纲视图（Outliner）选择的锁定空对象（Empty）"
     )
     bl_options = {"REGISTER", "UNDO"}
 
@@ -525,7 +540,7 @@ class HD2PB_OT_initialize_project(Operator):
         snapshot = _snapshot_project(project)
         try:
             if ownership.project_initialized(project):
-                raise ownership.HD2PBError("当前骨架（Armature）已经初始化物理骨项目，不会重复创建")
+                raise ownership.HD2PBError("当前骨架（Armature）已经初始化物理骨项目")
             if len(ownership.armature_objects(owner.data)) != 1:
                 raise ownership.HD2PBError(
                     "当前骨架数据（Armature datablock）被多个对象共享；请先让要制作的骨架成为单用户数据"
@@ -551,7 +566,7 @@ class HD2PB_OT_initialize_project(Operator):
 
 
 class HD2PB_OT_migrate_project(Operator):
-    """显式把旧开发期 schema 1/2 升级为 P6 schema 3。"""
+    """显式把旧开发期 schema 1/2 升级为当前 schema 3。"""
 
     bl_idname = "hd2pb.migrate_project"
     bl_label = "迁移项目数据"
@@ -1733,7 +1748,7 @@ class HD2PB_OT_create_collider_from_bone(Operator):
 
 
 class HD2PB_OT_create_dynamic_collider_from_bone(Operator):
-    """从姿态模式唯一活动模拟骨创建 P6 动态 Sphere/Capsule。"""
+    """从姿态模式唯一活动模拟骨创建动态 Sphere/Capsule。"""
 
     bl_idname = "hd2pb.create_dynamic_collider_from_bone"
     bl_label = "从活动模拟骨创建动态碰撞体"
@@ -1750,7 +1765,7 @@ class HD2PB_OT_create_dynamic_collider_from_bone(Operator):
             ("CAPSULE", "动态胶囊", "从当前模拟节点创建动态胶囊碰撞体"),
         ),
         default="SPHERE",
-        description="P6 动态碰撞体只支持球形和胶囊",
+        description="动态碰撞体只支持球形和胶囊",
     )
 
     @classmethod
@@ -1997,6 +2012,113 @@ class HD2PB_OT_rebuild_controllers(Operator):
             return _cancel(self, exc)
 
 
+def _publish_validation(context, owner, rows, status):
+    from . import diagnostics
+    diagnostics.publish(owner, rows, status=status)
+    for row in rows:
+        print('HD2PB 检查：', row if isinstance(row, str) else row['message'])
+    if not bpy.app.background:
+        if status in {'PASS', '结构检查通过'}:
+            # Restore the compact result menu on success. Keep the full snapshot
+            # available for manual review without opening the large dialog.
+            messages = tuple(row if isinstance(row, str) else row['message'] for row in rows)
+            def draw_report(menu, _context):
+                for message in messages:
+                    menu.layout.label(text=message)
+            context.window_manager.popup_menu(draw_report, title='物理骨检查结果', icon='CHECKMARK')
+        else:
+            bpy.ops.hd2pb.show_validation_report('INVOKE_DEFAULT')
+
+
+class HD2PB_OT_show_validation_report(Operator):
+    """分页显示完整检查快照，不修改制作数据。"""
+    bl_idname = 'hd2pb.show_validation_report'
+    bl_label = '完整物理检查列表'
+    bl_description = '查看本次会话的完整检查记录；参数更改后需要重新检查'
+    page: IntProperty(name='页', description='完整检查记录的当前页码', default=0, min=0, options={'SKIP_SAVE'})
+    previous_page: BoolProperty(name='上一页', default=False, options={'SKIP_SAVE'})
+    next_page: BoolProperty(name='下一页', default=False, options={'SKIP_SAVE'})
+
+    def invoke(self, context, _event):
+        from . import diagnostics
+        if not diagnostics.present():
+            self.report({'WARNING'}, '还没有检查记录，请先检查当前项目')
+            return {'CANCELLED'}
+        self.previous_page = self.next_page = False
+        self.check(context)
+        return context.window_manager.invoke_props_dialog(self, width=880)
+
+    def check(self, _context):
+        from . import diagnostics
+        saved = diagnostics.report()
+        pages = max(1, (len(saved['entries']) + 5) // 6) if saved else 1
+        previous, following = self.previous_page, self.next_page
+        old_page = self.page
+        # Property buttons update this dialog's operator instance. Invoking the
+        # report operator here would stack another modal dialog on every click.
+        self.previous_page = self.next_page = False
+        page = min(max(0, old_page), pages - 1)
+        self.page = min(max(0, page + int(following) - int(previous)), pages - 1)
+        return previous or following or self.page != old_page
+
+    def draw(self, context):
+        import textwrap
+        from . import diagnostics
+        saved = diagnostics.report()
+        if not saved:
+            self.layout.label(text='检查记录已清除，请重新检查')
+            return
+        rows = saved['entries']
+        size = 6
+        pages = max(1, (len(rows) + size - 1) // size)
+        page = min(self.page, pages - 1)
+        self.layout.label(text=f"{saved['owner_name']} — {saved['status']} — {len(rows)} 条记录")
+        self.layout.label(text='此为当前检查快照；修改后请重新检查。定位不显示隐藏对象。', icon='INFO')
+        try:
+            diagnostics.matching_owner(context, saved)
+            can_locate = True
+        except Exception:
+            can_locate = False
+            self.layout.label(text='当前不是原检查项目，定位已禁用', icon='ERROR')
+        for index in range(page * size, min((page + 1) * size, len(rows))):
+            row = rows[index]
+            box = self.layout.box()
+            for line in str(row['message']).splitlines() or ['']:
+                for wrapped in textwrap.wrap(line, width=56, replace_whitespace=False) or ['']:
+                    box.label(text=wrapped)
+            if row['entity_uuid']:
+                buttons = box.row()
+                buttons.enabled = can_locate
+                op = buttons.operator('hd2pb.locate_validation_issue', text='定位可见实体', icon='VIEWZOOM')
+                op.index = index
+        nav = self.layout.row(align=True)
+        left = nav.row(); left.enabled = page > 0
+        left.prop(self, 'previous_page', text='上一页', toggle=True)
+        nav.label(text=f'{page + 1} / {pages}')
+        right = nav.row(); right.enabled = page + 1 < pages
+        right.prop(self, 'next_page', text='下一页', toggle=True)
+
+    def execute(self, context):
+        return {'FINISHED'}
+
+
+class HD2PB_OT_locate_validation_issue(Operator):
+    """仅定位原项目中已经可见的唯一编辑实体。"""
+    bl_idname = 'hd2pb.locate_validation_issue'
+    bl_label = '定位检查实体'
+    bl_description = '仅选择原项目中可见的唯一对象'
+    index: IntProperty(name='检查条目', description='完整检查记录中的条目编号', default=0, min=0, options={'HIDDEN', 'SKIP_SAVE'})
+
+    def execute(self, context):
+        from . import diagnostics
+        try:
+            target = diagnostics.locate(context, self.index)
+            self.report({'INFO'}, f'已选择“{target.name}”')
+            return {'FINISHED'}
+        except Exception as exc:
+            return _cancel(self, exc)
+
+
 class HD2PB_OT_validate_project(Operator):
     """只读结构检查及同求解器短测。"""
 
@@ -2022,9 +2144,6 @@ class HD2PB_OT_validate_project(Operator):
                 include_previews=True,
                 require_chains=not enabled_pose_count,
             )
-            if issues:
-                suffix = f"；另有 {len(issues) - 1} 项" if len(issues) > 1 else ""
-                raise ownership.HD2PBError(issues[0] + suffix)
             if project.pose_drivers:
                 # Use the immutable SDK author contract: manual test controls
                 # never mask invalid source bindings or stale calibration.
@@ -2032,12 +2151,23 @@ class HD2PB_OT_validate_project(Operator):
                 try:
                     adapter_v1.clothing_pose_document(owner)
                 except PoseDriverError as exc:
-                    raise ownership.HD2PBError(str(exc)) from exc
+                    issues.append(str(exc))
+            if issues:
+                _publish_validation(context, owner,
+                    [dict(message=message, severity='ERROR') for message in issues], '结构检查失败')
+                self.report({'WARNING'}, f'检查发现 {len(issues)} 项结构／姿态问题；完整检查列表已保留，未运行求解短测')
+                return {'CANCELLED'}
             if not project.chains:
+                _publish_validation(context, owner, ['衣物姿态制作检查通过；无物理链，跳过弹簧短测。',
+                    '最终骨架绑定由 AQSDK 封包校验；修改后请重新检查。'], '结构检查通过')
                 self.report({'INFO'}, f'衣物姿态制作检查通过（启用 {enabled_pose_count} 条）；'
                             '无物理链，已跳过弹簧短测；最终骨架绑定由 AQSDK 封包校验')
                 return {'FINISHED'}
-            summary = adapter_v1.validate_authoring_object(owner)
+            try:
+                summary = adapter_v1.validate_authoring_object(owner)
+            except Exception as exc:
+                _publish_validation(context, owner, [dict(message=str(exc), severity='ERROR')], '格式检查失败')
+                raise
             from ..core import solver_check
             from .motion_preview import _document
             try:
@@ -2047,24 +2177,25 @@ class HD2PB_OT_validate_project(Operator):
                 result = dict(status='INCOMPLETE', cases=[], reason=str(exc))
             _LAST_SOLVER_CHECK = result
             lines = solver_check.summary_lines(result)
+            records = [dict(message=line, severity='INFO') for line in lines]
             print('HD2PB 物理骨检查：', owner.name, summary)
             for line in lines:
                 print(line)
             for row in result['cases']:
                 for message in row['messages']:
                     print('Native solver:', row['name'], message)
+                    records.append(dict(message=f"{row['name']}：{message}", severity='WARNING'))
                 if row.get('diagnostic_error'):
                     print('Native diagnostic error:', row['diagnostic_error'])
+                    records.append(dict(message=f"{row['name']} 诊断读取失败：{row['diagnostic_error']}", severity='WARNING'))
+                for location in (row.get('diagnostics') or {}).get('locations', []):
+                    records.append(dict(message=f"{row['name']}／{location['kind']}：{location['where']}；残差 {location['residual_m'] * 1000:.3f} mm",
+                                        where=location['where'], severity='WARNING'))
             locations = [loc for row in result['cases']
                          for loc in (row.get('diagnostics') or {}).get('locations', [])]
             brief = lines[0] + ('；'+locations[0]['where'] if locations else '；'.join(lines[1:3]))
             self.report({'INFO'} if result['status'] == 'PASS' else {'WARNING'}, brief)
-            if not bpy.app.background:
-                def draw_report(menu, _context):
-                    for line in lines:
-                        menu.layout.label(text=line)
-                context.window_manager.popup_menu(draw_report, title='物理骨检查结果',
-                    icon='CHECKMARK' if result['status'] == 'PASS' else 'ERROR')
+            _publish_validation(context, owner, records, result['status'])
             return {"FINISHED"}
         except Exception as exc:
             return _cancel(self, exc)
@@ -2089,6 +2220,7 @@ def _parameter_fields(entity_type):
             "reference_frame",
         ),
         properties.ENTITY_COLLIDER: ("kind", "group_mask", "collision_mask", "inside", "a", "b", "radius"),
+        properties.ENTITY_CHAIN_LINK: ("coupling", "max_correction"),
     }
     return fields.get(entity_type)
 
@@ -2120,12 +2252,12 @@ def _current_parameter_entity(context):
         owner, project, entity, parent = ownership.resolve_controller(context.object)
     except ownership.HD2PBError as exc:
         raise ownership.HD2PBError(
-            "请先选择 Profile、Node 或 Collider 的可选择 controller"
+            "请先选择 Profile、Node、Collider 或 ChainLink 的可选择 controller"
         ) from exc
     entity_type = context.object.hd2pb_entity_type
     if _parameter_fields(entity_type) is None:
         raise ownership.HD2PBError(
-            "当前选择的是项目或骨链 controller；请选择具体 Profile、Node 或 Collider"
+            "请选择具体 Profile、Node、Collider 或 ChainLink，而不是项目或骨链"
         )
     return owner, project, entity_type, entity, parent
 
@@ -2169,7 +2301,8 @@ def typed_preset_items(entity_type, *, include_default=False):
 
 def _select_library_preset(context, entity_type, name):
     """文件操作后刷新会话选择；用户库跨项目共用，不写 Armature 数据。"""
-    field = {"PROFILE": "preset_profile", "NODE": "preset_node", "COLLIDER": "preset_collider"}[entity_type]
+    field = {"PROFILE": "preset_profile", "NODE": "preset_node", "COLLIDER": "preset_collider",
+             "CHAIN_LINK": "preset_chain_link"}[entity_type]
     rows = typed_preset_items(entity_type)
     if name not in {row[0] for row in rows}:
         name = rows[0][0]
@@ -2432,6 +2565,48 @@ class HD2PB_OT_preview_isolate(Operator):
             return _cancel(self, exc)
 
 
+def _paste_targets(context, owner, entity_type, entity):
+    targets = {entity.uuid: entity}
+    for obj in tuple(context.selected_objects or ()):
+        if not (getattr(obj, 'hd2pb_controller_schema', 0) or getattr(obj, 'hd2pb_preview_schema', 0)):
+            continue
+        current_owner, _project, current, _parent = ownership.resolve_controller(obj)
+        if current_owner != owner or obj.hd2pb_entity_type != entity_type:
+            raise ownership.HD2PBError('多选粘贴只支持同项目、同类型实体；请移除其他物理实体后重试')
+        targets[current.uuid] = current
+    return list(targets.values())
+
+
+def _apply_parameter_batch(owner, entity_type, targets, incoming, *, node_mode="NUMERIC"):
+    """Prepare every target before writing, then commit and canonical-check one transaction."""
+    project = ownership.ensure_authoring_owner(owner)
+    previous = [_parameter_payload(entity_type, target) for target in targets]
+    prepared = [preset_v1.merge_parameters(entity_type, values, incoming, node_mode=node_mode)
+                for values in previous]
+    if entity_type == properties.ENTITY_NODE:
+        for target, values in zip(targets, prepared):
+            _node, chain = ownership.find_entity(project, entity_type, target.uuid)
+            if (not chain.root_swing and chain.nodes[0].uuid == target.uuid
+                    and (values['limit_kind'] != 'NONE' or values.get('reference_mode') != 'ANIMATED_SEGMENT'
+                         or values.get('override_collision_filter'))):
+                raise ownership.HD2PBError('固定驱动节点不能应用模拟角限或独立碰撞过滤；整批未修改')
+    try:
+        with preview.suspend_updates():
+            for target, values in zip(targets, prepared):
+                for key, value in values.items():
+                    setattr(target, key, value)
+            issues = ownership.canonical_issues(owner)
+            if issues:
+                raise ownership.HD2PBError('应用后物理数据无效：' + '；'.join(issues))
+        preview.flush_now()
+    except Exception:
+        with preview.suspend_updates():
+            for target, values in zip(targets, previous):
+                for key, value in values.items():
+                    setattr(target, key, value)
+        raise
+
+
 class HD2PB_OT_copy_entity_parameters(Operator):
     """把当前 Profile/Node/Collider 的物理参数复制到插件内剪贴板。"""
 
@@ -2454,6 +2629,7 @@ class HD2PB_OT_copy_entity_parameters(Operator):
                 properties.ENTITY_PROFILE: "弹簧参数配置",
                 properties.ENTITY_NODE: "链节点",
                 properties.ENTITY_COLLIDER: "碰撞体",
+                properties.ENTITY_CHAIN_LINK: "链组连接",
             }
             self.report(
                 {"INFO"},
@@ -2473,6 +2649,20 @@ class HD2PB_OT_paste_entity_parameters(Operator):
         "复制活动实体后，多选同项目、同类型实体统一粘贴；整批校验、失败整批回滚，不复制身份和绑定"
     )
     bl_options = {"REGISTER", "UNDO"}
+    node_mode: EnumProperty(name="节点参数范围", description="选择仅数值、包含方向或仅方向；默认保留目标方向", items=_NODE_APPLY_MODES, default="NUMERIC")
+
+    def invoke(self, context, _event):
+        return context.window_manager.invoke_props_dialog(self, width=520)
+
+    def draw(self, context):
+        try:
+            owner, _project, kind, entity, _parent = _current_parameter_entity(context)
+            if kind == properties.ENTITY_NODE:
+                self.layout.prop(self, "node_mode")
+            self.layout.label(text=f"将修改 {len(_paste_targets(context, owner, kind, entity))} 个实体")
+            self.layout.label(text="身份、绑定和拓扑保持不变；方向按父骨局部空间复制")
+        except Exception as exc:
+            self.layout.label(text=str(exc), icon='ERROR')
 
     def execute(self, context):
         try:
@@ -2485,46 +2675,24 @@ class HD2PB_OT_paste_entity_parameters(Operator):
                     properties.ENTITY_PROFILE: "弹簧参数配置",
                     properties.ENTITY_NODE: "链节点",
                     properties.ENTITY_COLLIDER: "碰撞体",
+                    properties.ENTITY_CHAIN_LINK: "链组连接",
                 }[source_type]
                 target_label = {
                     properties.ENTITY_PROFILE: "弹簧参数配置",
                     properties.ENTITY_NODE: "链节点",
                     properties.ENTITY_COLLIDER: "碰撞体",
+                    properties.ENTITY_CHAIN_LINK: "链组连接",
                 }[entity_type]
                 raise ownership.HD2PBError(
                     f"剪贴板保存的是{source_label}参数，不能粘贴到{target_label}"
                 )
-            targets = {entity.uuid: entity}
-            for obj in tuple(context.selected_objects or ()):
-                if not (getattr(obj,'hd2pb_controller_schema',0) or getattr(obj,'hd2pb_preview_schema',0)):
-                    continue
-                current_owner, _project, current, _parent = ownership.resolve_controller(obj)
-                if current_owner != owner or obj.hd2pb_entity_type != entity_type:
-                    raise ownership.HD2PBError('多选粘贴只支持同项目、同类型实体；请移除其他物理实体后重试')
-                targets[current.uuid] = current
-            values = preset_v1.validate_parameters(entity_type, _PARAMETER_CLIPBOARD['parameters'])
-            if entity_type == properties.ENTITY_NODE:
-                for target in targets.values():
-                    _node, chain = ownership.find_entity(project,entity_type,target.uuid)
-                    if (not chain.root_swing and chain.nodes[0].uuid == target.uuid
-                            and (values['limit_kind'] != 'NONE'
-                                 or values.get('reference_mode',target.reference_mode) != 'ANIMATED_SEGMENT')):
-                        raise ownership.HD2PBError('固定驱动节点不能粘贴模拟角限；整批未修改')
-            previous = [(target, _parameter_payload(entity_type,target)) for target in targets.values()]
-            try:
-                with preview.suspend_updates():
-                    for target in targets.values():
-                        _apply_parameter_payload(entity_type,target,values)
-                    issues = ownership.canonical_issues(owner)
-                    if issues:
-                        raise ownership.HD2PBError('粘贴后物理数据无效：'+'；'.join(issues[:3]))
-            except Exception:
-                with preview.suspend_updates():
-                    for target, old_values in previous:
-                        for key,value in old_values.items(): setattr(target,key,value)
-                raise
+            targets = _paste_targets(context, owner, entity_type, entity)
+            _apply_parameter_batch(owner, entity_type, targets, _PARAMETER_CLIPBOARD['parameters'],
+                                   node_mode=self.node_mode)
             self.report({"INFO"}, f"已粘贴到 {len(targets)} 个同类型实体；UUID、名称、骨骼绑定和拓扑保持不变。")
             return {"FINISHED"}
+        except preset_v1.PresetError as exc:
+            return _cancel(self, ownership.HD2PBError(str(exc)))
         except Exception as exc:
             return _cancel(self, exc)
 
@@ -2574,10 +2742,16 @@ class HD2PB_OT_save_preset(Operator):
 def _preset_targets(context, owner, entity_type, entity, parent, scope):
     if scope == "CURRENT":
         return [entity]
-    if scope == "CHAIN_NODES":
+    if scope in {"CHAIN_NODES", "CHAIN_TAIL"}:
         if entity_type != properties.ENTITY_NODE or parent is None:
             raise ownership.HD2PBError("“整条骨链节点”范围只适用于当前选择的 Node")
-        return list(parent.nodes)[1:]
+        nodes = list(parent.nodes)
+        start = next((i for i, node in enumerate(nodes) if node.uuid == entity.uuid), -1)
+        if start < 0:
+            raise ownership.HD2PBError("当前节点不在所属链中，请重新选择")
+        return nodes[max(1, start) if scope == "CHAIN_TAIL" else 1:]
+    if scope != "SELECTED_TYPE":
+        raise ownership.HD2PBError("未知预设应用范围")
     targets = []
     for obj in tuple(context.selected_objects or ()):
         if not (
@@ -2590,7 +2764,9 @@ def _preset_targets(context, owner, entity_type, entity, parent, scope):
             current_owner, _project, current_entity, _parent = ownership.resolve_controller(obj)
         except ownership.HD2PBError:
             continue
-        if current_owner == owner and obj.hd2pb_entity_type == entity_type:
+        if current_owner != owner:
+            raise ownership.HD2PBError("选区包含另一物理项目；整批未修改")
+        if obj.hd2pb_entity_type == entity_type:
             targets.append(current_entity)
     if not targets:
         raise ownership.HD2PBError("当前选区没有同项目、同类型的有效 controller")
@@ -2617,6 +2793,7 @@ class HD2PB_OT_apply_preset(Operator):
 
     selected_name: StringProperty(name="选中的预设名称", description="由分类面板传入的精确预设名称", options={"HIDDEN"})
     entity_type: StringProperty(name="预设实体类型", description="由分类面板传入的预设类型，应用时必须与活动实体一致", options={"HIDDEN"})
+    node_mode: EnumProperty(name="节点参数范围", description="选择仅数值、包含方向或仅方向；默认保留目标方向", items=_NODE_APPLY_MODES, default="NUMERIC")
 
     preset_name: EnumProperty(
         name="参数预设",
@@ -2632,6 +2809,7 @@ class HD2PB_OT_apply_preset(Operator):
             ("CURRENT", "当前实体", "只修改当前选择的实体"),
             ("SELECTED_TYPE", "同类型选区", "修改当前选中的同项目、同类型 controller"),
             ("CHAIN_NODES", "整条骨链模拟节点", "当前为 Node 时修改所属 Chain 的全部可编辑模拟节点"),
+            ("CHAIN_TAIL", "当前节点至链尾", "包含当前及后续节点；跳过固定驱动节点，不改变其他链"),
         ),
         default="CURRENT",
     )
@@ -2639,12 +2817,19 @@ class HD2PB_OT_apply_preset(Operator):
     def invoke(self, context, _event):
         return context.window_manager.invoke_props_dialog(self, width=460)
 
-    def draw(self, _context):
+    def draw(self, context):
         if self.selected_name:
             self.layout.label(text=f"预设：{self.selected_name}")
         else:
             self.layout.prop(self, "preset_name")
         self.layout.prop(self, "scope")
+        try:
+            owner, _project, kind, entity, parent = _current_parameter_entity(context)
+            if kind == properties.ENTITY_NODE:
+                self.layout.prop(self, "node_mode")
+            self.layout.label(text=f"将修改 {len(_preset_targets(context, owner, kind, entity, parent, self.scope))} 个实体")
+        except Exception as exc:
+            self.layout.label(text=str(exc), icon='ERROR')
 
     def execute(self, context):
         try:
@@ -2660,16 +2845,7 @@ class HD2PB_OT_apply_preset(Operator):
                 expected_entity_type=entity_type,
             )
             targets = _preset_targets(context, owner, entity_type, entity, parent, self.scope)
-            previous = [_parameter_payload(entity_type, target) for target in targets]
-            try:
-                with preview.suspend_updates():
-                    for target in targets:
-                        _apply_parameter_payload(entity_type, target, document["parameters"])
-            except Exception:
-                with preview.suspend_updates():
-                    for target, values in zip(targets, previous):
-                        _apply_parameter_payload(entity_type, target, values)
-                raise
+            _apply_parameter_batch(owner, entity_type, targets, document["parameters"], node_mode=self.node_mode)
             self.report({"INFO"}, f"已向 {len(targets)} 个同类型实体应用预设；身份、绑定和拓扑未修改。")
             return {"FINISHED"}
         except preset_v1.PresetError as exc:
@@ -2773,6 +2949,69 @@ class HD2PB_OT_open_preset_directory(Operator):
             return _cancel(self, ownership.HD2PBError(str(exc)))
 
 
+def _chain_operation_targets(context, scope, *, allow_node=False):
+    owner, _project, entity, parent = ownership.resolve_controller(context.object, require_unique=True)
+    kind = context.object.hd2pb_entity_type
+    if kind not in ({properties.ENTITY_CHAIN, properties.ENTITY_NODE} if allow_node else {properties.ENTITY_CHAIN}):
+        raise ownership.HD2PBError("请先选择正式骨链" + ("或节点" if allow_node else ""))
+    if scope == 'CURRENT':
+        if kind == properties.ENTITY_NODE:
+            index = next(i for i, node in enumerate(parent.nodes) if node.uuid == entity.uuid)
+            return owner, [(parent, [(index, entity)])]
+        return owner, [(entity, list(enumerate(entity.nodes)))]
+    if scope != 'SELECTED_CHAINS':
+        raise ownership.HD2PBError('未知骨链操作范围')
+    chains = {}
+    for obj in tuple(context.selected_objects or ()):
+        if not (getattr(obj, 'hd2pb_controller_schema', 0) or getattr(obj, 'hd2pb_preview_schema', 0)):
+            continue
+        current_owner, _project, current, _parent = ownership.resolve_controller(obj, require_unique=True)
+        if current_owner != owner:
+            raise ownership.HD2PBError('选区包含另一物理项目；整批未修改')
+        if obj.hd2pb_entity_type == properties.ENTITY_CHAIN:
+            chains[current.uuid] = current
+    if not chains:
+        raise ownership.HD2PBError('选区没有同项目的正式骨链；空选区不会操作全部链')
+    return owner, [(chain, list(enumerate(chain.nodes))) for chain in chains.values()]
+
+
+def _commit_node_updates(owner, changes):
+    # All directions and merged values are resolved before the first RNA write.
+    previous = [(node, _parameter_payload(properties.ENTITY_NODE, node)) for node, _values in changes]
+    prepared = []
+    for (node, old), (_target, updates) in zip(previous, changes):
+        merged = dict(old)
+        merged.update(updates)
+        try:
+            prepared.append((node, preset_v1.validate_parameters(properties.ENTITY_NODE, merged)))
+        except preset_v1.PresetError as exc:
+            raise ownership.HD2PBError(str(exc)) from exc
+    try:
+        with preview.suspend_updates():
+            for node, values in prepared:
+                for key, value in values.items():
+                    setattr(node, key, value)
+            issues = ownership.canonical_issues(owner)
+            if issues:
+                raise ownership.HD2PBError('批处理后结构无效：' + '；'.join(issues))
+        preview.flush_now()
+    except Exception:
+        with preview.suspend_updates():
+            for node, values in previous:
+                for key, value in values.items():
+                    setattr(node, key, value)
+        raise
+
+
+def _draw_chain_impact(layout, context, scope, *, allow_node=False):
+    try:
+        _owner, rows = _chain_operation_targets(context, scope, allow_node=allow_node)
+        count = sum(sum(index > 0 for index, _node in nodes) for _chain, nodes in rows)
+        layout.label(text=f"范围：{len(rows)} 条链、{count} 个模拟节点（固定驱动不修改）")
+    except Exception as exc:
+        layout.label(text=str(exc), icon='ERROR')
+
+
 class HD2PB_OT_apply_limit_ramp(Operator):
     """按 RE Chain 的最大角限/迭代规则处理活动骨链。"""
 
@@ -2783,6 +3022,7 @@ class HD2PB_OT_apply_limit_ramp(Operator):
         "最大角限 × min(N / 最大迭代, 1)；固定驱动节点不会被修改"
     )
     bl_options = {"REGISTER", "UNDO"}
+    scope: EnumProperty(name="应用范围", description="仅当前骨链或明确选中的同项目骨链，不把空选区视为全部", items=_CHAIN_SCOPES, default="CURRENT")
 
     max_angle_limit: FloatProperty(
         name="最大角限（半角）",
@@ -2833,55 +3073,35 @@ class HD2PB_OT_apply_limit_ramp(Operator):
     def invoke(self, context, _event):
         return context.window_manager.invoke_props_dialog(self, width=460)
 
-    def draw(self, _context):
+    def draw(self, context):
         layout = self.layout
+        layout.prop(self, "scope")
         layout.prop(self, "max_angle_limit")
         layout.prop(self, "max_iteration")
         layout.prop(self, "align_to_next")
+        _draw_chain_impact(layout, context, self.scope)
 
     def execute(self, context):
         try:
-            owner, _project, chain, _parent = ownership.resolve_controller(
-                context.object,
-                expected_type=properties.ENTITY_CHAIN,
-                require_unique=True,
-            )
-            simulated = list(chain.nodes)[1:]
-            if not simulated:
-                raise ownership.HD2PBError("当前骨链没有可修改的模拟节点")
+            owner, rows = _chain_operation_targets(context, self.scope)
             angle_step = self.max_angle_limit / self.max_iteration
-            directions = {}
-            if self.align_to_next:
-                for index in range(1, len(chain.nodes)):
-                    try:
-                        directions[index] = _aligned_reference_direction(owner, chain, index)
-                    except ownership.HD2PBError:
+            changes = []
+            for chain, nodes in rows:
+                if len(nodes) < 2:
+                    raise ownership.HD2PBError('骨链没有模拟节点；整批未修改')
+                for index, node in nodes:
+                    if index == 0:
                         continue
-            previous = [_parameter_payload(properties.ENTITY_NODE, node) for node in simulated]
-            try:
-                with preview.suspend_updates():
-                    for index, node in enumerate(simulated, 1):
-                        # 批处理暂停了 RNA 自动对齐回调，故在同一事务内显式写入方向。
-                        # nodes[0] 是固定驱动锚点，永远不参与这里的写入。
-                        node.limit_kind = "CONE"
-                        node.limit_angle = min(angle_step * index, self.max_angle_limit)
-                        if index in directions:
-                            node.reference_direction = directions[index]
-                            node.reference_mode = "EXPLICIT_LOCAL"
-            except Exception:
-                with preview.suspend_updates():
-                    for node, values in zip(simulated, previous):
-                        for name, value in values.items():
-                            setattr(node, name, value)
-                preview.flush_now()
-                raise
-            # 操作符是显式用户命令，退出批量更新后立即落到视图；不依赖 timer
-            # 的下一次空闲调度，避免用户看到参数已写入但预览仍是旧状态。
-            preview.flush_now()
+                    values = dict(limit_kind='CONE', limit_angle=min(angle_step * index, self.max_angle_limit))
+                    if self.align_to_next:
+                        values.update(reference_direction=list(_aligned_reference_direction(owner, chain, index)),
+                                      reference_mode="EXPLICIT_LOCAL")
+                    changes.append((node, values))
+            _commit_node_updates(owner, changes)
             self.report(
                 {"INFO"},
-                f"已为 {len(simulated)} 个模拟节点启用圆锥角限并应用渐变。"
-                + (f"已对齐 {len(directions)} 个实际受限入段，退化骨段 {len(simulated)-len(directions)} 个保留原方向。"
+                f"已为 {len(rows)} 条链的 {len(changes)} 个模拟节点启用圆锥角限并应用渐变。"
+                + ("已对齐实际受限入段；整批已校验。"
                    if self.align_to_next else "保留手动方向。"),
             )
             return {"FINISHED"}
@@ -2988,72 +3208,56 @@ class HD2PB_OT_align_limit_to_next(Operator):
     bl_description = (
         "选择 Node 时处理当前入段；选择 Chain 时批量对齐角限到上一节点→当前节点的 Rest 方向。"
         "铰链/椭圆球面写入限制轴，圆锥写入显式父骨局部参考方向；共线段使用父骨局部稳定切向回退，"
-        "末端圆锥也可对齐；末端铰链/椭圆轴、无限制和零长度段跳过并报告"
+        "末端圆锥也可对齐；末端铰链/椭圆轴及无限制节点跳过，缺骨或零长度段整批拒绝"
     )
     bl_options = {"REGISTER", "UNDO"}
 
+    scope: EnumProperty(name="应用范围", description="仅当前实体或明确选中的同项目骨链，不跨项目操作", items=_CHAIN_SCOPES, default="CURRENT")
+
+    def invoke(self, context, _event):
+        return context.window_manager.invoke_props_dialog(self, width=520)
+
+    def draw(self, context):
+        self.layout.prop(self, "scope")
+        _draw_chain_impact(self.layout, context, self.scope, allow_node=True)
+        try:
+            _owner, rows = _chain_operation_targets(context, self.scope, allow_node=True)
+            count = sum(sum(index > 0 and node.limit_kind != 'NONE' and
+                            (index < len(chain.nodes) - 1 or node.limit_kind == 'CONE')
+                            for index, node in nodes) for chain, nodes in rows)
+            self.layout.label(text=f"实际可对齐 {count} 个节点；其余固定／无限制／末端方向轴跳过")
+        except Exception:
+            pass
+
     def execute(self, context):
         try:
-            owner, _project, entity, parent = ownership.resolve_controller(context.object)
-            entity_type = context.object.hd2pb_entity_type
-            if entity_type == properties.ENTITY_NODE:
-                chain = parent
-                node_index = next(
-                    index for index, current in enumerate(chain.nodes) if current.uuid == entity.uuid
-                )
-                candidates = [(node_index, entity)]
-                batch = False
-            elif entity_type == properties.ENTITY_CHAIN:
-                chain = entity
-                candidates = list(enumerate(chain.nodes))
-                batch = True
-            else:
-                raise ownership.HD2PBError("请先选择 Chain 或 Node controller")
-
+            owner, rows = _chain_operation_targets(context, self.scope, allow_node=True)
+            batch = self.scope == 'SELECTED_CHAINS' or context.object.hd2pb_entity_type == properties.ENTITY_CHAIN
             prepared = []
             skipped = 0
-            for index, node in candidates:
-                if (
-                    index == 0
-                    or (index >= len(chain.nodes) - 1 and node.limit_kind != 'CONE')
-                    or node.limit_kind == "NONE"
-                ):
-                    skipped += 1
-                    if not batch:
-                        raise ownership.HD2PBError(
-                            "当前节点是末端铰链/椭圆或无限制，不能自动对齐方向轴"
-                        )
-                    continue
-                try:
-                    reference_direction = _aligned_reference_direction(owner, chain, index)
-                    limit_axis = (
-                        None
-                        if node.limit_kind == "CONE"
-                        else _aligned_limit_axis(owner, chain, index)
-                    )
-                except ownership.HD2PBError:
-                    if not batch:
-                        raise
-                    skipped += 1
-                    continue
-                prepared.append((node, reference_direction, limit_axis, node.limit_kind))
-
-            with preview.suspend_updates():
-                for node, reference_direction, limit_axis, _limit_kind in prepared:
-                    node.reference_direction = reference_direction
-                    node.reference_mode = "EXPLICIT_LOCAL"
-                    if limit_axis is not None:
-                        node.limit_axis = limit_axis
-
+            for chain, candidates in rows:
+                for index, node in candidates:
+                    if (index == 0 or (index >= len(chain.nodes) - 1 and node.limit_kind != 'CONE')
+                            or node.limit_kind == "NONE"):
+                        skipped += 1
+                        if not batch:
+                            raise ownership.HD2PBError("当前节点是固定驱动、末端方向轴或无限制，不能自动对齐")
+                        continue
+                    values = dict(reference_direction=list(_aligned_reference_direction(owner, chain, index)),
+                                  reference_mode='EXPLICIT_LOCAL')
+                    if node.limit_kind != 'CONE':
+                        values['limit_axis'] = list(_aligned_limit_axis(owner, chain, index))
+                    prepared.append((node, values))
+            _commit_node_updates(owner, prepared)
             processed = len(prepared)
-            processed_types = [item[3] for item in prepared]
+            processed_types = [item[0].limit_kind for item in prepared]
 
             if batch:
                 level = {"INFO"} if processed else {"WARNING"}
                 self.report(
                     level,
-                    f"整条骨链限制轴对齐完成：处理 {processed} 个，跳过 {skipped} 个；"
-                    "跳过项包括无限制、末端铰链/椭圆、缺失骨或零长度段；受限入段方向已写入。",
+                    f"{len(rows)} 条骨链限制轴对齐完成：处理 {processed} 个，跳过 {skipped} 个；"
+                    "跳过项仅固定驱动、无限制和末端铰链/椭圆；整批已校验。",
                 )
             else:
                 type_name = {
@@ -3130,7 +3334,7 @@ class HD2PB_OT_switch_mode(Operator):
     bl_label = "切换物理骨编辑模式"
     bl_description = (
         "精确激活当前项目所属的骨架对象，并在物体模式（Object Mode）与姿态模式（Pose Mode）"
-        "之间切换；不会在场景中猜测其他骨架，也不会修改物理骨参数"
+        "之间切换"
     )
     bl_options = {"REGISTER"}
 
@@ -3421,6 +3625,8 @@ CLASSES = (
     HD2PB_OT_set_collider_bone,
     HD2PB_OT_rebuild_controllers,
     HD2PB_OT_validate_project,
+    HD2PB_OT_show_validation_report,
+    HD2PB_OT_locate_validation_issue,
     HD2PB_OT_export_v1,
     HD2PB_OT_refresh_preview,
     HD2PB_OT_preview_isolate,

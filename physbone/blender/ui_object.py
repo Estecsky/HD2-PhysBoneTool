@@ -5,6 +5,7 @@ from __future__ import annotations
 from bpy.types import Panel
 
 from . import ownership, properties
+from .authoring_ui_ops import draw_mask_field
 
 
 def _resolved(context, entity_type=None):
@@ -41,6 +42,7 @@ def _resolved_simulated_node(context):
 
 def _draw_parameter_tools(layout):
     box = layout.box()
+    box.operator_context = "INVOKE_DEFAULT"
     box.label(text="参数复用工具", icon="PASTEDOWN")
     box.operator("hd2pb.copy_entity_parameters", text="复制活动实体参数", icon="COPYDOWN")
     box.operator("hd2pb.paste_entity_parameters", text="粘贴到选中同类型实体", icon="PASTEDOWN")
@@ -79,6 +81,7 @@ class HD2PB_PT_object_identity(Panel):
             error.label(text=project.preview_error_message)
         row = layout.row(align=True)
         row.operator("hd2pb.validate_project", icon="CHECKMARK")
+        row.operator("hd2pb.show_validation_report", text="完整检查列表", icon="VIEWZOOM")
         row.operator("hd2pb.refresh_preview", icon="FILE_REFRESH")
 
 
@@ -129,7 +132,7 @@ class HD2PB_PT_object_profile(Panel):
         layout.prop(profile, "damping")
         layout.prop(profile, "gravity")
         layout.prop(profile, "wind")
-        layout.prop(profile, "collision_mask")
+        draw_mask_field(layout, profile, "collision_mask")
         layout.label(text="此掩码只用于新链；已有链请在骨链属性修改", icon="INFO")
         layout.label(text="Chain 引用此配置 UUID；改名称不会断开引用", icon="INFO")
         _draw_parameter_tools(layout)
@@ -157,10 +160,10 @@ class HD2PB_PT_object_chain(Panel):
             context.object, properties.ENTITY_CHAIN
         )
         layout.prop(chain, "display_name")
-        layout.prop(chain, "group_mask")
-        layout.prop(chain, "collision_mask")
+        draw_mask_field(layout, chain, "group_mask")
+        draw_mask_field(layout, chain, "collision_mask")
         layout.label(text="所属组=我是谁；允许组=我能碰谁（双方都须允许）", icon="INFO")
-        layout.label(text="单组 1/2/4/8；组合相加，例如 3=1+2；允许组 0=关闭")
+        layout.label(text="支持组 1–31；按钮编号不等于掩码；普通允许组 0=关闭")
         layout.label(text="节点默认继承；单独设置的节点可以覆盖骨链规则")
         root_is_target = bool(chain.nodes and chain.nodes[0].bone_name in
                               ownership.pose_driver_target_bones(project, _owner.data.bones))
@@ -209,6 +212,7 @@ class HD2PB_PT_object_chain(Panel):
             )
         layout.label(text="完整节点层级请在 Outliner 展开此链；这里不铺开长列表", icon="INFO")
         layout.operator("hd2pb.preview_isolate", text="隔离此骨链预览", icon="HIDE_OFF").action = "ISOLATE"
+        layout.operator_context = "INVOKE_DEFAULT"
         layout.operator(
             "hd2pb.apply_limit_ramp",
             text="按最大角限/迭代应用渐变…",
@@ -245,13 +249,10 @@ class HD2PB_PT_object_node(Panel):
         collision = layout.box()
         collision.label(text="碰撞过滤（节点球）", icon="MOD_PHYSICS")
         collision.prop(node, "override_collision_filter")
-        if node.override_collision_filter:
-            collision.prop(node, "group_mask")
-            collision.prop(node, "collision_mask")
-        else:
-            collision.label(text=f"继承骨链：所属组 {chain.group_mask} / 允许组 {chain.collision_mask}")
+        draw_mask_field(collision, node, "group_mask", parent=chain)
+        draw_mask_field(collision, node, "collision_mask", parent=chain)
         collision.label(text="所属组=我是谁；允许组=我能碰谁；双方都须允许")
-        collision.label(text="单组 1/2/4/8；组合相加；允许组 0=关闭碰撞")
+        collision.label(text="31 个独立组；允许组 0=关闭碰撞；继承不表示未选组")
         collision.label(text="排除后允许穿过碰撞体；摆动与链约束仍保留", icon="INFO")
         layout.prop(node, "limit_kind")
         if node.limit_kind != "NONE":
@@ -278,6 +279,7 @@ class HD2PB_PT_object_node(Panel):
             )
             layout.label(text="旋转角限轴会立即写入显式局部参考方向并改变导出数据", icon="INFO")
         align = layout.column()
+        align.operator_context = "INVOKE_DEFAULT"
         align.enabled = index > 0 and node.limit_kind != "NONE" and (
             index < len(chain.nodes) - 1 or node.limit_kind == "CONE"
         )
@@ -328,10 +330,10 @@ class HD2PB_PT_object_collider(Panel):
             layout.label(text="动态模式必须吸附唯一模拟节点，且只支持球形或胶囊", icon="PHYSICS")
         else:
             layout.label(text="静态模式可清空为 Unit 根，但不能吸附模拟骨", icon="INFO")
-        layout.prop(collider, "group_mask")
-        layout.prop(collider, "collision_mask")
+        draw_mask_field(layout, collider, "group_mask")
+        draw_mask_field(layout, collider, "collision_mask")
         layout.label(text="所属组=我是谁；允许组=我能碰谁；双方都须允许", icon="INFO")
-        layout.label(text="单组 1/2/4/8；组合相加；允许组 0=关闭此碰撞体")
+        layout.label(text="31 个独立组；允许组 0=关闭此碰撞体")
         layout.prop(collider, "inside")
         layout.prop(collider, "a")
         if collider.kind != "SPHERE":
@@ -340,8 +342,12 @@ class HD2PB_PT_object_collider(Panel):
         radius.enabled = collider.kind != "PLANE"
         radius.prop(collider, "radius")
         if project.preview_allow_collider_transform:
-            layout.label(text="实验视图变换只用于试摆；A/B/半径仍是导出权威值", icon="EXPERIMENTAL")
+            layout.label(text="试摆须显式应用才写入 A/B/半径；导出不会自动提交", icon="INFO")
             layout.label(text="修改任一权威形状参数会覆盖并重置视图变换", icon="INFO")
+            row = layout.row(align=True)
+            row.operator_context = "INVOKE_DEFAULT"
+            row.operator("hd2pb.apply_collider_transform", text="应用试摆到物理参数", icon="CHECKMARK")
+            row.operator("hd2pb.reset_collider_transform", text="还原试摆", icon="LOOP_BACK")
         else:
             layout.label(text="A/B/半径是权威物理参数；碰撞体视图变换当前锁定", icon="LOCKED")
         layout.operator("hd2pb.preview_isolate", text="隔离此碰撞体预览", icon="HIDE_OFF").action = "ISOLATE"
@@ -392,6 +398,7 @@ class HD2PB_PT_object_chain_link(Panel):
             icon="META_CAPSULE",
         )
         layout.operator("hd2pb.preview_isolate", text="隔离此链组连接预览", icon="HIDE_OFF").action = "ISOLATE"
+        _draw_parameter_tools(layout)
         remove = layout.operator("hd2pb.remove_chain_link", text="删除当前链组连接", icon="TRASH")
         remove.entity_uuid = link.uuid
 
@@ -424,8 +431,9 @@ class HD2PB_PT_object_link_collision(Panel):
             icon="BONE_DATA",
         )
         layout.prop(collision, "radius")
-        layout.prop(collision, "group_mask")
-        layout.prop(collision, "collision_mask")
+        draw_mask_field(layout, collision, "group_mask")
+        draw_mask_field(layout, collision, "collision_mask")
+        layout.label(text="链间碰撞所属组和允许组均不可为 0", icon="INFO")
         layout.label(text="胶囊两个端点每轮从两条链的当前模拟位置重建", icon="INFO")
         layout.operator("hd2pb.preview_isolate", text="隔离此链间碰撞体", icon="HIDE_OFF").action = "ISOLATE"
 

@@ -26,6 +26,7 @@ TAG = "HD2PB_TransientMotionPreview"
 _SESSION = None
 _REGISTERED = False
 _MESSAGE = ""
+_CLEANUP_PENDING = False
 
 
 def _packed(matrix, scale=1.0):
@@ -117,6 +118,7 @@ class Session:
             self.objects.append(self.display)
             self.display.data = owner.data.copy()
             self.armature_data = self.display.data
+            self.armature_data[TAG] = self.tag
             self.collection.objects.link(self.display)
             self.display.animation_data_clear()
             for constraint in tuple(self.display.constraints): self.display.constraints.remove(constraint)
@@ -277,15 +279,52 @@ def driver_telemetry(owner, name):
 
 def stop():
     global _SESSION, _MESSAGE
-    if _SESSION:
-        _SESSION.close()
-        _SESSION = None
+    session, _SESSION = _SESSION, None
+    if session:
+        try:
+            session.close()
+        finally:
+            # No stale wrappers may survive a failed pre-Undo cleanup.
+            session.owner = session.display = session.view_layer = None
+            session.mesh_sources.clear()
+            session.objects.clear()
+            session.armature_data = session.collection = None
     _MESSAGE = ''
+
+
+def _cleanup_orphans():
+    """Remove only tagged, inactive preview copies restored by Undo/load.
+
+    Resolve current IDs afresh; never keep RNA wrappers across data changes.
+    Shared mesh data and untagged objects/collections are not ours to delete.
+    """
+    global _CLEANUP_PENDING
+    active_tag = _SESSION.tag if _SESSION else None
+    for obj in tuple(bpy.data.objects):
+        tag = obj.get(TAG)
+        if not tag or tag == active_tag:
+            continue
+        bpy.data.objects.remove(obj, do_unlink=True)
+    for data in tuple(bpy.data.armatures):
+        if data.users == 0 and data.get(TAG) and data.get(TAG) != active_tag:
+            bpy.data.armatures.remove(data)
+    for collection in tuple(bpy.data.collections):
+        if (collection.get(TAG) and collection.get(TAG) != active_tag
+                and not collection.objects and not collection.children):
+            bpy.data.collections.remove(collection)
+    _CLEANUP_PENDING = False
+
+
+def _ensure_timer():
+    if _REGISTERED and not bpy.app.timers.is_registered(_timer):
+        bpy.app.timers.register(_timer, first_interval=.1, persistent=True)
 
 
 def _timer():
     global _MESSAGE
     if not _REGISTERED: return None
+    if _CLEANUP_PENDING:
+        _cleanup_orphans()
     if _SESSION:
         try:
             status = _SESSION.step()
@@ -305,29 +344,59 @@ def _timer():
 
 @persistent
 def _before_data_change(*_args):
+    global _CLEANUP_PENDING
+    _CLEANUP_PENDING = False
     stop()
+
+
+@persistent
+def _after_data_change(*_args):
+    global _CLEANUP_PENDING
+    # Do not remove restored IDs while Blender is decoding the Undo snapshot.
+    _CLEANUP_PENDING = True
+    _ensure_timer()
+
+
+@persistent
+def _before_save(*_args):
+    stop()
+    # A save can precede the deferred cleanup after Undo/load.
+    _cleanup_orphans()
+
+
+_HANDLERS = (
+    ('load_pre', _before_data_change), ('undo_pre', _before_data_change),
+    ('redo_pre', _before_data_change), ('save_pre', _before_save),
+    ('load_post', _after_data_change), ('undo_post', _after_data_change),
+    ('redo_post', _after_data_change),
+)
 
 
 def owned_state_present(): return bool(_REGISTERED or _SESSION)
 
 
 def register():
-    global _REGISTERED
+    global _REGISTERED, _CLEANUP_PENDING
     if _REGISTERED: return
-    for name in ('load_pre', 'save_pre', 'undo_pre', 'redo_pre'):
+    for name, callback in _HANDLERS:
         handlers = getattr(bpy.app.handlers, name)
-        if _before_data_change not in handlers: handlers.append(_before_data_change)
+        if callback not in handlers: handlers.append(callback)
     _REGISTERED = True
-    if not bpy.app.timers.is_registered(_timer): bpy.app.timers.register(_timer, first_interval=.1)
+    _CLEANUP_PENDING = True
+    _ensure_timer()
 
 
 def unregister():
-    global _REGISTERED
+    global _REGISTERED, _CLEANUP_PENDING
     stop()
     if bpy.app.timers.is_registered(_timer): bpy.app.timers.unregister(_timer)
-    for name in ('load_pre', 'save_pre', 'undo_pre', 'redo_pre'):
+    for name, callback in _HANDLERS:
         handlers = getattr(bpy.app.handlers, name)
-        if _before_data_change in handlers: handlers.remove(_before_data_change)
+        if callback in handlers: handlers.remove(callback)
+    # RestrictData during failed registration may not expose current IDs.
+    if hasattr(bpy.data, 'objects'):
+        _cleanup_orphans()
+    _CLEANUP_PENDING = False
     _REGISTERED = False
 
 
@@ -346,6 +415,8 @@ class HD2PB_OT_motion_preview_start(Operator):
             if owner is None: raise PreviewError('请选择物理骨项目')
             ownership.ensure_authoring_owner(owner)
             stop()
+            _cleanup_orphans()
+            _ensure_timer()
             _SESSION = Session(owner, test_motion=self.test_motion,
                                target_only=self.target_only, use_pose_drivers=self.use_pose_drivers)
             _SESSION.step(0.)

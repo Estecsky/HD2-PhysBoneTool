@@ -481,7 +481,7 @@ def build(document: dict) -> tuple[bytes, dict]:
     if not isinstance(document, dict):
         raise Gate("top level must be an object")
     if "link_pairs" in document:
-        raise Gate("HD2PHY1 已移除 P5 LinkPair；Chain Link/Link Collision 归入后续 P6 合同")
+        raise Gate("HD2PHY1 不再支持 link_pairs；请使用 chain_links 及其 collisions")
     if "link_collisions" in document:
         raise Gate("link_collisions: 必须内嵌在所属 chain_links[].collisions")
     raw_unit_id = document.get("unit_id")

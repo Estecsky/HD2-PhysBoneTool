@@ -12,6 +12,7 @@ from collections import defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass
 import math
+import struct
 import time
 
 import bpy
@@ -609,6 +610,25 @@ def _ensure_stage_material(stage, owner, project, kind, variant=""):
 
 
 def _set_curve_points(data, payload, faces=()):
+    # Undo already restores most projection data. Do not invalidate every
+    # spline/Hook dependency when the restored geometry is already correct.
+    # Compare in Blender's float32 storage precision, not Python float64.
+    if faces and any(len(face) != 3 or any(index < 0 or index >= len(payload.points)
+                                        for index in face) for face in faces):
+        raise ownership.HD2PBError("角限 Curve 包含无效三角面索引")
+    rows = ([tuple(payload.points[index] for index in face) for face in faces]
+            if faces else [payload.points] if payload.points else [])
+    cyclic = bool(faces or payload.cyclic)
+    def stored(value):
+        return struct.unpack('f', struct.pack('f', value))[0]
+    if len(data.splines) == len(rows) and all(
+        spline.type == 'POLY' and spline.use_cyclic_u == cyclic
+        and len(spline.points) == len(points)
+        and all(tuple(point.co) == tuple(stored(value) for value in (*expected, 1.0))
+                for point, expected in zip(spline.points, points))
+        for spline, points in zip(data.splines, rows)
+    ):
+        return
     data.splines.clear()
     if not payload.points:
         return
@@ -706,6 +726,15 @@ def _visible(project, obj):
     return not isolated or obj.hd2pb_entity_uuid == isolated or obj.get(DATA_CHAIN_KEY, "") == isolated
 
 
+def _style_node_proxy(obj, project):
+    preview_layers.style_node_proxy(obj, project)
+    isolated = _effective_isolation_uuid(project)
+    if not obj.hide_viewport and isolated and obj.hd2pb_entity_uuid != isolated:
+        found = ownership.find_entity(project, properties.ENTITY_NODE, obj.hd2pb_entity_uuid)
+        chain = found[1] if found else None
+        obj.hide_viewport = chain is None or chain.uuid != isolated
+
+
 def _style_object(obj, project):
     variant = _expected_material_variant(
         project,
@@ -783,6 +812,15 @@ def _style_object(obj, project):
 
 
 def _sync_chain_hooks(obj, owner, spec):
+    managed = [modifier for modifier in obj.modifiers
+               if modifier.type == 'HOOK' and modifier.name.startswith('HD2PB 骨钩 · ')]
+    if not managed and not spec.hook_bones:
+        return
+    if (len(managed) == len(spec.hook_bones)
+            and not _chain_hook_issues(obj, owner, expected_bones=spec.hook_bones)
+            and all(modifier.show_render and modifier.falloff_radius == 0.0
+                    for modifier in managed)):
+        return
     for modifier in tuple(obj.modifiers):
         if modifier.type == "HOOK" and modifier.name.startswith("HD2PB 骨钩 · "):
             obj.modifiers.remove(modifier)
@@ -922,11 +960,8 @@ def _attach_preview_object(obj, logical_parent, owner, spec):
             raise ownership.HD2PBError(
                 f"角限预览引用的父骨骼“{spec.parent_bone}”不存在"
             )
-        obj.parent = owner
-        obj.parent_type = "BONE"
-        obj.parent_bone = spec.parent_bone
-        # Blender Bone Parent 的局部原点位于骨尾；移回骨头作为锥顶。
-        obj.location = (0.0, -bone.length, 0.0)
+        from . import binding
+        binding.attach(obj, owner, spec.parent_bone)
         return
     obj.parent = logical_parent
     obj.parent_type = "OBJECT"
@@ -1017,13 +1052,11 @@ def _new_limit_axis_object(collection, owner, project, node, spec, stage, *, cha
         obj.hide_render = True
         obj.hide_select = False
         obj.show_name = False
-        obj.parent = owner
-        obj.parent_type = "BONE"
-        obj.parent_bone = node.bone_name
         bone = owner.data.bones.get(node.bone_name)
         if bone is None:
             raise ownership.HD2PBError(f"角限旋转轴引用的骨骼“{node.bone_name}”不存在")
-        obj.location = (0.0, -bone.length, 0.0)
+        from . import binding
+        binding.attach(obj, owner, node.bone_name)
         obj.rotation_mode = "XYZ"
         obj.rotation_euler = spec.axis_rotation
         obj.scale = (1.0, 1.0, 1.0)
@@ -1115,10 +1148,8 @@ def _sync_limit_axis_object(obj, owner, project, node, spec):
     bone = owner.data.bones.get(node.bone_name)
     if bone is None:
         raise ownership.HD2PBError(f"角限旋转轴引用的骨骼“{node.bone_name}”不存在")
-    obj.parent = owner
-    obj.parent_type = "BONE"
-    obj.parent_bone = node.bone_name
-    obj.location = (0.0, -bone.length, 0.0)
+    from . import binding
+    binding.attach(obj, owner, node.bone_name, preserve_legacy=True)
     obj.empty_display_type = "ARROWS"
     obj.empty_display_size = max(node_display_radius(node.radius), 0.04)
     obj.lock_location = (True, True, True)
@@ -1464,10 +1495,8 @@ def _set_collider_endpoint(obj, owner, project, bone_name, label):
     # 端点名称会直接绘制在视图中。多个胶囊共用同一个起点或终点骨时，
     # 使用“· 002 / · 003”消歧，内部 UUID 只保存在对象属性中。
     set_display_name(obj, label, readable_fallback=True)
-    obj.parent = owner
-    obj.parent_type = "BONE"
-    obj.parent_bone = bone.name
-    obj.location = (0.0, -bone.length, 0.0)
+    from . import binding
+    binding.attach(obj, owner, bone.name, preserve_legacy=True)
     obj.rotation_mode = "XYZ"
     obj.rotation_euler = (0.0, 0.0, 0.0)
     obj.scale = (1.0, 1.0, 1.0)
@@ -1575,12 +1604,12 @@ def stage_chain_previews(
         zip(simulated, node_controllers),
         start=1,
     ):
-        controller.name = _safe_label(node.bone_name, "缺失骨骼")
+        set_display_name(controller, _safe_label(node.bone_name, "缺失骨骼"))
         controller.empty_display_type = "SPHERE"
         controller.empty_display_size = node_display_radius(node.radius)
-        preview_layers.style_node_proxy(controller, project)
+        _style_node_proxy(controller, project)
         controller.show_name = bool(
-            project.preview_show_names and project.preview_show_node_names
+            project.preview_show_node_names
         )
         radius_spec = PreviewSpec(
             "NODE_RADIUS",
@@ -1728,8 +1757,10 @@ def _validate_limit_axis_for_update(index, obj):
         )
     if obj.type != "EMPTY" or obj.data is not None:
         raise ownership.HD2PBError(f"角限旋转轴“{obj.name}”必须是无数据 Empty")
-    if getattr(obj, "parent_type", "") != "BONE":
-        raise ownership.HD2PBError(f"角限旋转轴“{obj.name}”必须使用 Bone Parent")
+    from . import binding
+    result = ownership.find_entity(project, properties.ENTITY_NODE, obj.hd2pb_entity_uuid)
+    if result is None or not binding.matches(obj, owner, result[0].bone_name):
+        raise ownership.HD2PBError(f"角限旋转轴“{obj.name}”骨骼跟随损坏；请重建编辑对象")
     if tuple(obj.lock_location) != (True, True, True):
         raise ownership.HD2PBError(f"角限旋转轴“{obj.name}”的位置必须锁定")
     if tuple(obj.lock_scale) != (True, True, True):
@@ -1902,10 +1933,10 @@ def apply_project_style(owner, index=None):
                 entity_type == properties.ENTITY_NODE
                 and project.preview_show_node_names
             )
-            controller.hide_viewport = False
             if entity_type == properties.ENTITY_NODE:
-                preview_layers.style_node_proxy(controller, project)
-            if entity_type != properties.ENTITY_NODE:
+                _style_node_proxy(controller, project)
+            else:
+                controller.hide_viewport = False
                 controller.empty_display_size = 0.0001
     for chain in project.chains:
         for node in list(chain.nodes)[1:]:
@@ -2338,7 +2369,7 @@ def refresh_entity(owner, entity_type, entity_uuid, index=None, aspects=None):
         )
         controller.empty_display_type = "SPHERE"
         controller.empty_display_size = node_display_radius(entity.radius)
-        preview_layers.style_node_proxy(controller, project)
+        _style_node_proxy(controller, project)
         controller.show_name = bool(
             project.preview_show_node_names
         )
@@ -2799,17 +2830,12 @@ def preview_issues(owner):
                         if len(axis_matches) != 1 or obj.parent != axis_matches[0]:
                             issues.append(f"预览对象“{obj.name}”没有挂到角限旋转轴 Empty")
                     elif parent_bone:
+                        from . import binding
                         bone = owner.data.bones.get(parent_bone)
-                        expected_location = (
-                            (0.0, -bone.length, 0.0)
-                            if bone is not None
-                            else None
-                        )
+                        expected_location = binding.expected_location(obj, owner, parent_bone)
                         if (
                             bone is None
-                            or obj.parent != owner
-                            or obj.parent_type != "BONE"
-                            or obj.parent_bone != parent_bone
+                            or not binding.matches(obj, owner, parent_bone)
                             or any(
                                 abs(current - wanted) > 1.0e-6
                                 for current, wanted in zip(
@@ -3078,6 +3104,18 @@ def mark_rna_dirty(item, entity_type, aspect=ASPECT_GEOMETRY):
     entity_uuid = project.project_uuid if entity_type == properties.ENTITY_PROJECT else getattr(item, "uuid", "")
     if owner is not None and entity_uuid:
         _queue(owner, entity_type, entity_uuid, aspect)
+
+
+def consume_entity_updates(owner, entity_type, entity_uuid):
+    """Consume callbacks already handled by a synchronous entity transaction.
+
+    Other entities and project-wide requests are deliberately left untouched.
+    """
+    identity = (owner.as_pointer(), owner.data.hd2pb_project.project_uuid, entity_type, entity_uuid)
+    for pending in (_DIRTY, _DEFERRED):
+        for key in tuple(pending):
+            if key[:4] == identity:
+                pending.pop(key, None)
 
 
 @contextmanager

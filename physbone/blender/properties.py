@@ -45,6 +45,10 @@ def _collider_library_items(_self, _context):
     return _library_items("COLLIDER")
 
 
+def _chain_link_library_items(_self, _context):
+    return _library_items("CHAIN_LINK")
+
+
 def _library_selection_get(entity_type):
     def get_selection(self):
         rows = _library_items(entity_type)
@@ -377,7 +381,7 @@ class HD2PB_Profile(PropertyGroup):
 
 
 class HD2PB_Node(PropertyGroup):
-    """链中的一个骨绑定节点；P3 不允许存储任意位置。"""
+    """链中的一个骨绑定节点；位置由绑定骨骼决定。"""
 
     uuid: StringProperty(
         name="节点 UUID",
@@ -576,7 +580,7 @@ class HD2PB_Chain(PropertyGroup):
 
 
 class HD2PB_Collider(PropertyGroup):
-    """HD2PHY1 的静态骨绑定碰撞体。"""
+    """HD2PHY1 的固定或动态骨绑定碰撞体。"""
 
     uuid: StringProperty(
         name="碰撞体 UUID",
@@ -609,8 +613,8 @@ class HD2PB_Collider(PropertyGroup):
     bone_name: StringProperty(
         name="吸附骨骼",
         description=(
-            "碰撞体跟随的非模拟骨骼；留空表示跟随 Unit 根。HD2PHY1 不允许碰撞体跟随"
-            "正在模拟的骨骼"
+            "静态模式跟随非模拟骨骼，留空表示 Unit 根；动态模式必须绑定唯一模拟节点。"
+            "动态模式不支持无限平面"
         ),
     )
     bone_name_b: StringProperty(
@@ -778,11 +782,30 @@ class HD2PB_ChainLink(PropertyGroup):
     )
 
 
+def _chain_profile_items(self, context):
+    from . import chain_profile_ops
+    return chain_profile_ops.profile_items(self, context)
+
+
+def _chain_profile_get(self):
+    from . import chain_profile_ops
+    return chain_profile_ops.selection_get(self)
+
+
+def _chain_profile_set(self, value):
+    from . import chain_profile_ops
+    chain_profile_ops.selection_set(self, value)
+
+
 class HD2PB_PresetLibrary(PropertyGroup):
     """会话预设选择和折叠状态；不进入 Armature canonical 数据或 Undo。"""
     show_chain_profile_picker: BoolProperty(
         name="切换弹簧参数配置", default=True, options={"HIDDEN", "SKIP_SAVE"},
         description="展开当前骨链可切换的配置列表；收起时仍显示当前配置",
+    )
+    chain_profile: EnumProperty(
+        name="骨链参数预设", description="列出当前项目已有参数配置；用于统一修改所选骨链的配置引用",
+        options={"SKIP_SAVE"}, items=_chain_profile_items, get=_chain_profile_get, set=_chain_profile_set,
     )
     preset_profile: EnumProperty(name="弹簧参数预设", description="用户库中 PROFILE 类型的可复用弹簧参数", options={"SKIP_SAVE"}, items=_profile_library_items,
         get=_library_selection_get("PROFILE"), set=_library_selection_set("PROFILE"))
@@ -790,6 +813,8 @@ class HD2PB_PresetLibrary(PropertyGroup):
         get=_library_selection_get("NODE"), set=_library_selection_set("NODE"))
     preset_collider: EnumProperty(name="碰撞体参数预设", description="用户库中 COLLIDER 类型的可复用碰撞体参数", options={"SKIP_SAVE"}, items=_collider_library_items,
         get=_library_selection_get("COLLIDER"), set=_library_selection_set("COLLIDER"))
+    preset_chain_link: EnumProperty(name="链连接数值预设", description="只复用 coupling / max_correction，不复制链绑定或条带约束", options={"SKIP_SAVE"}, items=_chain_link_library_items,
+        get=_library_selection_get("CHAIN_LINK"), set=_library_selection_set("CHAIN_LINK"))
 
 
 class HD2PB_Project(PropertyGroup):
@@ -813,7 +838,7 @@ class HD2PB_Project(PropertyGroup):
         default=0,
         min=0,
         description=(
-            "0 表示尚未初始化；P3/P4 项目使用 schema 1/2，P6 项目使用 schema 3。"
+            "0 表示尚未初始化；旧项目使用 schema 1/2，当前项目使用 schema 3。"
             "旧项目只能通过“迁移项目数据”显式升级，不会在载入、注册或绘制面板时静默修改"
         ),
         options={"HIDDEN"},
@@ -853,7 +878,7 @@ class HD2PB_Project(PropertyGroup):
         name="显示实体预览",
         default=True,
         description=(
-            "总开关：显示由 canonical 参数自动生成的彩色 Curve + Geometry Nodes 实体。"
+            "总开关：显示节点球形 Empty 及由 canonical 参数自动生成的彩色 Curve + Geometry Nodes 实体。"
             "Geometry Nodes 可在求值阶段生成表面，但不会创建 Mesh Object 或 Mesh 数据块。关闭只隐藏制作辅助体，"
             "不会删除参数、controller 或影响导出"
         ),
@@ -866,9 +891,21 @@ class HD2PB_Project(PropertyGroup):
         update=_update_project_style,
     )
     preview_show_nodes: BoolProperty(
-        name="显示节点半径",
+        name="显示节点半径实体",
         default=False,
         description="显示绑定在骨骼头部的 Node radius 实体球",
+        update=_update_project_style,
+    )
+    preview_show_node_spheres: BoolProperty(
+        name="显示节点球形",
+        default=True,
+        description="显示用于选择节点的球形 Empty（线框球）；独立于彩色节点半径实体，并受预览总开关控制",
+        update=_update_project_style,
+    )
+    preview_xray_node_spheres: BoolProperty(
+        name="节点球形穿透",
+        default=True,
+        description="节点球形 Empty 使用原生前置显示；独立于彩色节点半径实体的穿透设置",
         update=_update_project_style,
     )
     preview_show_limits: BoolProperty(
@@ -899,10 +936,10 @@ class HD2PB_Project(PropertyGroup):
         name="旧版穿透设置（兼容保留）",
         default=True,
         options={"HIDDEN"},
-        description="只保留旧文件字段；新预览使用六个独立穿透设置",
+        description="只保留旧文件字段；新预览使用分类独立穿透设置",
         update=_update_project_style,
     )
-    preview_xray_nodes: BoolProperty(name="骨链节点穿透", description="节点球及选择代理使用原生前置显示；全局 X-Ray 由 Blender 处理，不挖空骨架周围", default=True, update=_update_project_style)
+    preview_xray_nodes: BoolProperty(name="节点半径实体穿透", description="彩色节点半径实体使用原生前置显示；不控制球形 Empty，全局 X-Ray 由 Blender 处理", default=True, update=_update_project_style)
     preview_xray_limits: BoolProperty(name="角度限制穿透", description="圆锥及参考轴使用原生前置显示；圆锥保留线框，同层物体仍按空间深度显示", default=True, update=_update_project_style)
     preview_xray_chains: BoolProperty(name="骨链曲线穿透", description="骨链曲线使用原生前置显示；不改变骨骼、曲线位置或材质", default=True, update=_update_project_style)
     preview_xray_chain_links: BoolProperty(name="链组连接穿透", description="链组连接使用原生前置显示；不改变链接物理参数", default=True, update=_update_project_style)
@@ -936,12 +973,12 @@ class HD2PB_Project(PropertyGroup):
         update=_update_project_style,
     )
     preview_allow_collider_transform: BoolProperty(
-        name="实验：允许视图变换碰撞体",
+        name="允许碰撞体视图试摆",
         default=False,
         description=(
             "允许在物体模式直接移动、旋转、缩放可选择的 Collider Curve，用于快速试摆。"
-            "这些变换只影响本次制作视图，不写入 HD2PHY1；属性栏的形状、A/B、半径或吸附设置一经修改，"
-            "会按权威参数覆盖并重置视图变换。关闭本项也会立即重置视图变换"
+            "试摆不会自动导出；必须显式点击“应用试摆到物理参数”才能提交，或用“还原试摆”取消。"
+            "无法表达的变换会拒绝应用。修改形状、A/B、半径或吸附设置，以及关闭本项，都会重置试摆"
         ),
         update=_update_project_style,
     )
@@ -1042,6 +1079,10 @@ class HD2PB_Project(PropertyGroup):
         name="当前隔离实体 UUID",
         description="只显示当前实体时使用的瞬时 UUID；清空表示显示全部已启用分类",
         options={"HIDDEN", "SKIP_SAVE"},
+    )
+    preview_focus_snapshot: StringProperty(
+        name="类别专注前显示快照", default="", options={"HIDDEN"},
+        description="仅保存本项目六类显示与隔离的 JSON 快照，支持撤销及保存重开后的恢复；不进入物理导出",
     )
     preview_error_message: StringProperty(
         name="实体预览刷新错误",

@@ -38,5 +38,6 @@ def style(obj, project):
 
 
 def style_node_proxy(obj, project):
-    """可选择的球形 Empty 与节点实体使用同一个穿透开关。"""
-    obj.show_in_front = xray(project, P.PREVIEW_NODE_RADIUS)
+    """可选择的球形 Empty 独立显示/穿透，并服从实体预览总开关。"""
+    obj.show_in_front = bool(project.preview_xray_node_spheres)
+    obj.hide_viewport = not (project.preview_enabled and project.preview_show_node_spheres)

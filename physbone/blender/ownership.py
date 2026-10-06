@@ -1074,6 +1074,7 @@ def controller_issues(owner):
             )
 
         entity, _parent = expected[key]
+        from . import binding
         expected_location = (0.0, 0.0, 0.0)
         if controller.hd2pb_entity_type in {
             properties.ENTITY_CHAIN,
@@ -1096,37 +1097,25 @@ def controller_issues(owner):
                 > 1.0e-6
             ):
                 issues.append(f"节点编辑对象“{controller.name}”的球半径没有同步 canonical radius")
-            if (
-                controller.parent != owner
-                or controller.parent_type != "BONE"
-                or controller.parent_bone != entity.bone_name
-            ):
+            if not binding.matches(controller, owner, entity.bone_name):
                 issues.append(
                     f"节点编辑对象“{controller.name}”没有正确吸附骨骼“{entity.bone_name}”"
                 )
             if bone is not None:
-                expected_location = (0.0, -bone.length, 0.0)
+                expected_location = binding.expected_location(controller, owner, entity.bone_name)
         elif (
             controller.hd2pb_entity_type == properties.ENTITY_COLLIDER
             and entity.bone_name
             and not (entity.kind == "CAPSULE" and getattr(entity, "bone_name_b", ""))
         ):
             bone = owner.data.bones.get(entity.bone_name)
-            if (
-                controller.parent != owner
-                or controller.parent_type != "BONE"
-                or controller.parent_bone != entity.bone_name
-            ):
+            if not binding.matches(controller, owner, entity.bone_name):
                 issues.append(
                     f"碰撞体编辑对象“{controller.name}”没有正确吸附骨骼“{entity.bone_name}”"
                 )
             if bone is not None:
-                expected_location = (0.0, -bone.length, 0.0)
-        elif (
-            controller.parent != owner
-            or controller.parent_type != "OBJECT"
-            or controller.parent_bone
-        ):
+                expected_location = binding.expected_location(controller, owner, entity.bone_name)
+        elif not binding.matches(controller, owner):
             issues.append(f"编辑对象“{controller.name}”没有绑定到所属骨架对象（Armature Object）")
 
         if any(abs(a - b) > 1.0e-6 for a, b in zip(controller.location, expected_location)):

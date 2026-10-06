@@ -80,7 +80,7 @@ def _project_from_context(context):
 
 
 def _current_project_from_context(context):
-    """只读判断当前上下文是否允许显示 P4 编辑子面板。"""
+    """只读判断当前上下文是否允许显示编辑子面板。"""
 
     owner, project = _project_from_context(context)
     if owner is None or project is None:
@@ -389,7 +389,6 @@ class HD2PB_PT_sidebar_object(Panel):
             box.operator("hd2pb.initialize_project", icon="ADD")
             box.operator("hd2pb.convert_mmd", icon="PHYSICS")
             box.operator("hd2pb.convert_vrm", icon="IMPORT")
-            box.label(text="初始化不会修改骨骼、权重或网格", icon="INFO")
             return
         if _draw_owner_warning(layout, context, owner):
             return
@@ -412,20 +411,21 @@ class HD2PB_PT_sidebar_object(Panel):
             layout.operator("hd2pb.convert_mmd", icon="PHYSICS")
             layout.operator("hd2pb.convert_vrm", icon="IMPORT")
         batch = layout.box()
+        batch.operator_context = "INVOKE_DEFAULT"
         batch.label(text="角限批量工具", icon="CONSTRAINT_BONE")
         entity_type = getattr(context.object, "hd2pb_entity_type", properties.ENTITY_NONE)
         ramp = batch.column()
         ramp.enabled = entity_type == properties.ENTITY_CHAIN
         ramp.operator(
             "hd2pb.apply_limit_ramp",
-            text="沿活动骨链应用角限渐变…",
+            text="当前 / 所选骨链角限渐变…",
             icon="IPO_EASE_IN_OUT",
         )
         align = batch.column()
         align.enabled = entity_type in {properties.ENTITY_CHAIN, properties.ENTITY_NODE}
         align.operator(
             "hd2pb.align_limit_to_next",
-            text="当前节点/整条链对齐实际受限骨段",
+            text="当前 / 所选骨链对齐受限骨段…",
             icon="ORIENTATION_LOCAL",
         )
         lists = layout.box()
@@ -518,7 +518,7 @@ class HD2PB_PT_sidebar_object(Panel):
         validate.operator("hd2pb.validate_project", text="检查物理骨项目", icon="CHECKMARK")
         maintenance.operator("hd2pb.refresh_preview", text="修复 controller 与实体预览", icon="FILE_REFRESH")
         maintenance.operator("hd2pb.migrate_project", icon="SORTTIME")
-        maintenance.operator("hd2pb.export_v1", text="导出 HD2PHY1 物理骨配置…", icon="EXPORT")
+        maintenance.operator("hd2pb.export_v1", text="更新物理与姿态独立配套包…", icon="EXPORT")
         op = layout.operator("hd2pb.switch_mode", text="切换到姿态模式", icon="POSE_HLT")
         op.target_mode = "POSE"
         layout.label(text="详细参数请在选中 Outliner 编辑对象后查看对象属性", icon="PROPERTIES")
@@ -561,11 +561,22 @@ class HD2PB_PT_sidebar_object_preview(Panel):
             error.label(text="最近一次实体预览刷新或清理失败", icon="ERROR")
             error.label(text=project.preview_error_message)
         layout.prop(project, "preview_enabled")
+        focus = layout.box()
+        focus.label(text="当前项目类别专注", icon="HIDE_OFF")
+        row = focus.row(align=True)
+        for action, label in (("NODES", "节点"), ("LIMITS", "角限"), ("COLLIDERS", "碰撞体")):
+            row.operator("hd2pb.preview_focus", text="只看" + label).action = action
+        row = focus.row()
+        row.enabled = bool(project.preview_focus_snapshot)
+        row.operator("hd2pb.preview_focus", text="恢复专注前显示", icon="LOOP_BACK").action = "RESTORE"
+        if not project.preview_enabled:
+            focus.label(text="预览总开关已关闭", icon="INFO")
         visibility = layout.column()
         visibility.enabled = project.preview_enabled
         visibility.label(text="分类穿透（Blender 原生前置显示）", icon="ARMATURE_DATA")
         visibility.label(text="同层实体按空间深度显示，无固定类别覆盖顺序")
         for shown, xray in (
+            ("preview_show_node_spheres", "preview_xray_node_spheres"),
             ("preview_show_nodes", "preview_xray_nodes"),
             ("preview_show_limits", "preview_xray_limits"),
             ("preview_show_chains", "preview_xray_chains"),
@@ -594,6 +605,7 @@ class HD2PB_PT_sidebar_object_preview(Panel):
         show_all = layout.operator("hd2pb.preview_isolate", text="显示全部启用的预览", icon="HIDE_OFF")
         show_all.action = "SHOW_ALL"
         layout.operator("hd2pb.refresh_preview", text="修复损坏的实体预览", icon="FILE_REFRESH")
+        layout.operator("hd2pb.show_validation_report", text="打开完整检查列表", icon="VIEWZOOM")
         layout.label(text="参数拖动会按高频固定节拍连续刷新，无需手动重建", icon="INFO")
 
 
@@ -617,8 +629,9 @@ class HD2PB_PT_sidebar_object_clipboard(Panel):
     def draw(self, context):
         layout = self.layout
         entity_type = getattr(context.object, "hd2pb_entity_type", properties.ENTITY_NONE)
-        supported = entity_type in {properties.ENTITY_PROFILE, properties.ENTITY_NODE, properties.ENTITY_COLLIDER}
+        supported = entity_type in {properties.ENTITY_PROFILE, properties.ENTITY_NODE, properties.ENTITY_COLLIDER, properties.ENTITY_CHAIN_LINK}
         column = layout.column()
+        column.operator_context = "INVOKE_DEFAULT"
         column.enabled = supported
         column.operator("hd2pb.copy_entity_parameters", text="复制活动实体参数", icon="COPYDOWN")
         column.operator("hd2pb.paste_entity_parameters", text="粘贴到选中同类型实体", icon="PASTEDOWN")
@@ -647,7 +660,7 @@ class HD2PB_PT_sidebar_object_presets(Panel):
     def draw(self, context):
         layout = self.layout
         entity_type = getattr(context.object, "hd2pb_entity_type", properties.ENTITY_NONE)
-        supported = entity_type in {properties.ENTITY_PROFILE, properties.ENTITY_NODE, properties.ENTITY_COLLIDER}
+        supported = entity_type in {properties.ENTITY_PROFILE, properties.ENTITY_NODE, properties.ENTITY_COLLIDER, properties.ENTITY_CHAIN_LINK}
         _owner, project = _current_project_from_context(context)
         column = layout.column()
         column.operator_context = "INVOKE_DEFAULT"
@@ -659,7 +672,8 @@ class HD2PB_PT_sidebar_object_presets(Panel):
         row.operator("hd2pb.open_preset_directory", text="打开预设文件夹", icon="FILE_FOLDER")
         for kind, field, label in (("PROFILE", "preset_profile", "弹簧参数"),
                                    ("NODE", "preset_node", "节点参数"),
-                                   ("COLLIDER", "preset_collider", "碰撞体参数")):
+                                   ("COLLIDER", "preset_collider", "碰撞体参数"),
+                                   ("CHAIN_LINK", "preset_chain_link", "链连接数值")):
             box = layout.box()
             box.label(text=f"{label}预设")
             state = context.window_manager.hd2pb_preset_library
@@ -676,8 +690,11 @@ class HD2PB_PT_sidebar_object_presets(Panel):
             delete_row.enabled = valid
             remove = delete_row.operator("hd2pb.delete_preset", text="", icon="TRASH")
             remove.selected_name, remove.entity_type = name, kind
+            if kind == "PROFILE":
+                from . import chain_profile_ops
+                chain_profile_ops.draw_panel(layout, context)
         if not supported:
-            layout.label(text="请先选择可保存参数的类型专属 controller")
+            layout.label(text="JSON 预设需选对应实体；骨链配置可应用到所选骨链")
 
 
 class HD2PB_PT_sidebar_pose(Panel):
@@ -768,7 +785,7 @@ class HD2PB_PT_sidebar_pose(Panel):
             text="主按钮：单选起始骨，沿唯一子级到末端",
             icon="INFO",
         )
-        tools.label(text="遇到分叉会拒绝，不会猜测分支")
+        tools.label(text="遇到分叉会拒绝")
         tools.label(
             text="有父骨：父骨是锚点，选中骨开始模拟",
             icon="LOCKED",

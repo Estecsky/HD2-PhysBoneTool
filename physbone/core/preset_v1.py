@@ -24,7 +24,9 @@ MAX_PRESET_BYTES = 1024 * 1024
 ENTITY_PROFILE = "PROFILE"
 ENTITY_NODE = "NODE"
 ENTITY_COLLIDER = "COLLIDER"
-ENTITY_TYPES = frozenset({ENTITY_PROFILE, ENTITY_NODE, ENTITY_COLLIDER})
+ENTITY_CHAIN_LINK = "CHAIN_LINK"
+ENTITY_TYPES = frozenset({ENTITY_PROFILE, ENTITY_NODE, ENTITY_COLLIDER, ENTITY_CHAIN_LINK})
+NODE_DIRECTION_FIELDS = frozenset({"limit_axis", "reference_mode", "reference_direction", "reference_frame"})
 
 PRESET_UNITS = {
     "angle": "radian",
@@ -237,10 +239,20 @@ def _validate_collider(parameters: Mapping[str, object]) -> dict[str, object]:
     return result
 
 
+def _validate_chain_link(parameters: Mapping[str, object]) -> dict[str, object]:
+    # Endpoints, strip mode and child collisions are topology, not a parameter preset.
+    _exact_keys(parameters, frozenset({"coupling", "max_correction"}), "parameters")
+    return {
+        "coupling": _number(parameters["coupling"], "parameters.coupling", 0.000001, 1.0),
+        "max_correction": _number(parameters["max_correction"], "parameters.max_correction", 0.000001, 10.0),
+    }
+
+
 _PARAMETER_VALIDATORS = {
     ENTITY_PROFILE: _validate_profile,
     ENTITY_NODE: _validate_node,
     ENTITY_COLLIDER: _validate_collider,
+    ENTITY_CHAIN_LINK: _validate_chain_link,
 }
 
 
@@ -267,6 +279,27 @@ def make_preset(entity_type: object, parameters: object) -> dict[str, object]:
     }
 
 
+def merge_parameters(entity_type, current, incoming, *, node_mode="NUMERIC"):
+    """Build a fully validated result before any RNA writes; never silently reset a frame.
+
+    Old presets may omit reference/filter extensions; omitted values remain the target's.
+    Incompatible limit-kind/frame combinations fail explicitly instead of losing hand tuning.
+    """
+    result = validate_parameters(entity_type, current)
+    source = validate_parameters(entity_type, incoming)
+    if node_mode not in {"NUMERIC", "ALL", "DIRECTION"}:
+        raise PresetError("未知节点应用模式")
+    if entity_type != ENTITY_NODE or node_mode == "ALL":
+        result.update(source)
+    else:
+        result.update({key: value for key, value in source.items()
+                       if (key in NODE_DIRECTION_FIELDS) == (node_mode == "DIRECTION")})
+    try:
+        return validate_parameters(entity_type, result)
+    except PresetError as exc:
+        raise PresetError("参数与目标保留的限制类型／方向不兼容；请核对节点或明确选择包含方向：" + str(exc)) from exc
+
+
 def validate_preset(
     document: object, *, expected_entity_type: str | None = None
 ) -> dict[str, object]:
@@ -289,10 +322,10 @@ def validate_preset(
         )
     entity_type = top["entity_type"]
     if not isinstance(entity_type, str) or entity_type not in ENTITY_TYPES:
-        raise PresetError("entity_type 只能是 PROFILE、NODE 或 COLLIDER")
+        raise PresetError("entity_type 只能是 PROFILE、NODE、COLLIDER 或 CHAIN_LINK")
     if expected_entity_type is not None:
         if expected_entity_type not in ENTITY_TYPES:
-            raise PresetError("expected_entity_type 只能是 PROFILE、NODE 或 COLLIDER")
+            raise PresetError("expected_entity_type 只能是 PROFILE、NODE、COLLIDER 或 CHAIN_LINK")
         if entity_type != expected_entity_type:
             raise PresetError(
                 f"预设类型是 {entity_type}，不能应用到 {expected_entity_type}"
@@ -412,7 +445,7 @@ def resolve_preset_path(directory: Path | str, name: object) -> Path:
 def typed_preset_directory(directory: Path | str, entity_type: str) -> Path:
     """用户库仅使用固定类型子目录；不读取旧平铺预设或允许链接逃逸。"""
     if entity_type not in ENTITY_TYPES:
-        raise PresetError("预设目录类型只能是 PROFILE、NODE 或 COLLIDER")
+        raise PresetError("预设目录类型只能是 PROFILE、NODE、COLLIDER 或 CHAIN_LINK")
     root = Path(directory).expanduser().resolve(strict=False)
     target = (root / entity_type).resolve(strict=False)
     if target != root / entity_type:
@@ -489,7 +522,7 @@ def list_presets(
     """列出目录内全部有效专属预设；任一候选损坏时整体拒绝，避免静默忽略。"""
 
     if entity_type is not None and entity_type not in ENTITY_TYPES:
-        raise PresetError("entity_type 只能是 PROFILE、NODE 或 COLLIDER")
+        raise PresetError("entity_type 只能是 PROFILE、NODE、COLLIDER 或 CHAIN_LINK")
     root = Path(directory).expanduser().resolve(strict=False)
     if not root.exists():
         return ()
@@ -537,6 +570,7 @@ def delete_preset(directory: Path | str, name: object) -> Path:
 
 
 __all__ = (
+    "ENTITY_CHAIN_LINK",
     "ENTITY_COLLIDER",
     "ENTITY_NODE",
     "ENTITY_PROFILE",
@@ -554,6 +588,7 @@ __all__ = (
     "import_preset",
     "typed_preset_directory",
     "make_preset",
+    "merge_parameters",
     "normalize_preset_filename",
     "read_preset",
     "resolve_preset_path",
