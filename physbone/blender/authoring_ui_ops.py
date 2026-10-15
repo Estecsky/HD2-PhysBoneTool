@@ -9,7 +9,8 @@ from . import ownership, preview, properties
 
 MASK_MAX = 0x7fffffff
 SHOW_FIELDS = ('preview_show_node_spheres', 'preview_show_nodes', 'preview_show_limits', 'preview_show_chains',
-               'preview_show_chain_links', 'preview_show_link_collisions', 'preview_show_colliders')
+               'preview_show_chain_links', 'preview_show_link_collisions', 'preview_show_colliders',
+               'preview_show_driver_limits')
 FOCUS_FIELDS = {'NODES': 'preview_show_nodes', 'LIMITS': 'preview_show_limits',
                 'COLLIDERS': 'preview_show_colliders'}
 MASK_TYPES = {'PROFILE', 'CHAIN', 'NODE', 'COLLIDER', 'LINK_COLLISION'}
@@ -275,9 +276,13 @@ class HD2PB_OT_preview_focus(Operator):
             if self.action == 'RESTORE':
                 if not saved: raise ValueError('当前项目没有待恢复的专注显示快照')
                 target = json.loads(saved)
-                if set(target.get('fields', {})) == set(SHOW_FIELDS) - {'preview_show_node_spheres'}:
-                    # Older snapshots predate the independent Empty display switch.
-                    target['fields']['preview_show_node_spheres'] = True
+                fields = target.get('fields', {})
+                optional_defaults = {'preview_show_node_spheres': True, 'preview_show_driver_limits': False}
+                if (isinstance(fields, dict) and set(SHOW_FIELDS) - set(optional_defaults) <= set(fields)
+                        and set(fields) <= set(SHOW_FIELDS)):
+                    # Old six/seven-field snapshots use each new RNA default.
+                    for field, default in optional_defaults.items():
+                        fields.setdefault(field, default)
                 if target.get('project_uuid') != project.project_uuid or set(target.get('fields', {})) != set(SHOW_FIELDS):
                     raise ValueError('专注显示快照不属于当前项目或字段不完整')
                 if any(type(v) is not bool for v in target['fields'].values()) or not isinstance(target.get('isolation'), str):
@@ -289,6 +294,10 @@ class HD2PB_OT_preview_focus(Operator):
                 if self.action not in FOCUS_FIELDS: raise ValueError('未知专注类别')
                 focused = {FOCUS_FIELDS[self.action]}
                 if self.action == 'NODES': focused.add('preview_show_node_spheres')
+                if self.action == 'LIMITS':
+                    preferences = json.loads(saved).get('fields', {}) if saved else before['fields']
+                    if preferences.get('preview_show_driver_limits') is True:
+                        focused.add('preview_show_driver_limits')
                 target = dict(fields={f: f in focused for f in SHOW_FIELDS}, isolation='')
                 next_saved = saved or json.dumps(before, ensure_ascii=False)
             with preview.suspend_updates():

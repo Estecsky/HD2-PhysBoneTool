@@ -218,6 +218,7 @@ class HD2PB_PT_object_chain(Panel):
             text="按最大角限/迭代应用渐变…",
             icon="IPO_EASE_IN_OUT",
         )
+        layout.operator("hd2pb.remove_chain_limits", text="移除当前 / 所选骨链角限…", icon="X")
         remove = layout.operator("hd2pb.remove_chain", text="删除当前物理骨链", icon="TRASH")
         remove.entity_uuid = chain.uuid
 
@@ -244,7 +245,7 @@ class HD2PB_PT_object_node(Panel):
         index = next((i for i, item in enumerate(chain.nodes) if item.uuid == node.uuid), -1)
         layout.label(text=f"所属链：{chain.display_name}", icon="CONSTRAINT_BONE")
         layout.label(text=f"绑定骨骼：{node.bone_name}（模拟节点 {index}）", icon="BONE_DATA")
-        layout.label(text="静止姿态（Rest Pose）用于绑定和退化预检；目标与角限中心来自当前动画", icon="LOCKED")
+        layout.label(text="弹簧目标跟随动画；角限默认对齐静止骨段，并随起点骨骼运动", icon="LOCKED")
         layout.prop(node, "radius")
         collision = layout.box()
         collision.label(text="碰撞过滤（节点球）", icon="MOD_PHYSICS")
@@ -267,17 +268,11 @@ class HD2PB_PT_object_node(Panel):
             if node.limit_kind in {"HINGE", "SPHERICAL"}:
                 layout.prop(node, "limit_axis")
             layout.separator()
-            layout.label(text="HD2PHY1 角限参考方向", icon="ORIENTATION_LOCAL")
-            layout.prop(node, "reference_mode")
-            if node.reference_mode == "EXPLICIT_LOCAL":
-                layout.prop(node, "reference_direction")
-            elif node.reference_mode == "EXPLICIT_FRAME":
-                layout.prop(node, "reference_frame")
-            layout.label(
-                text="方向属于当前节点父骨局部空间；导出时自动单位化",
-                icon="INFO",
-            )
-            layout.label(text="旋转角限轴会立即写入显式局部参考方向并改变导出数据", icon="INFO")
+            if index > 0:
+                layout.label(text=f"受限骨段：{chain.nodes[index - 1].bone_name} → {node.bone_name}", icon="ORIENTATION_LOCAL")
+                layout.label(text="若调整时未在视图发生变化，则调整的是驱动骨到首模拟节点的角限", icon="INFO")
+                layout.label(text="需在可见性中勾选显示完整骨链与显示驱动骨角度限制", icon="INFO")
+            layout.label(text="锥顶在骨段起点；旋转角限轴即可调整朝向，完整旋转会保存", icon="INFO")
         align = layout.column()
         align.operator_context = "INVOKE_DEFAULT"
         align.enabled = index > 0 and node.limit_kind != "NONE" and (

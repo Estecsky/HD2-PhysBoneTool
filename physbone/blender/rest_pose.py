@@ -5,9 +5,9 @@ Rest edits. No preview is generated and no source project or weights are changed
 """
 import math
 
-from mathutils import Matrix, Quaternion, Vector
+from mathutils import Matrix, Vector
 
-from . import ownership, preview, properties
+from . import angle_limits, ownership, preview, properties
 from .transfer import required_bones
 
 
@@ -37,10 +37,19 @@ class RestPoseEdit:
         self.old_rest = {name: _rigid(owner.data.bones[name].matrix_local.copy(), name)
                          for name in self.required_bones}
         self.original = []
+        self.node_frames = {}
         for chain in self.project.chains:
-            for node in chain.nodes:
-                for field in ('limit_axis', 'reference_direction', 'reference_frame'):
+            for index, node in enumerate(chain.nodes):
+                for field in ('limit_axis', 'reference_direction', 'reference_frame', 'limit_frame'):
                     self.original.append((node, field, tuple(getattr(node, field))))
+                for field in ('reference_mode', 'limit_frame_valid'):
+                    self.original.append((node, field, getattr(node, field)))
+                if index:
+                    # Capture before the caller changes Rest. Legacy animated/rest
+                    # references must not silently follow the newly baked skeleton.
+                    self.node_frames[node.uuid] = (
+                        angle_limits.resolve_frame(owner, chain, index),
+                        angle_limits.resolve_axis(node))
         for collider in self.project.colliders:
             for field in ('a', 'b'):
                 self.original.append((collider, field, tuple(getattr(collider, field))))
@@ -73,12 +82,11 @@ class RestPoseEdit:
                     continue
                 name = chain.nodes[index - 1].bone_name
                 basis = (final[name].inverted() @ poses[name]).to_3x3()
-                for field in ('limit_axis', 'reference_direction'):
-                    writes.append((node, field, tuple(basis @ Vector(getattr(node, field)))))
-                x, y, z, w = node.reference_frame
-                q = basis.to_quaternion() @ Quaternion((w, x, y, z))
-                q.normalize()
-                writes.append((node, 'reference_frame', (q.x, q.y, q.z, q.w)))
+                frame, axis = self.node_frames[node.uuid]
+                writes.append((node, 'limit_axis', tuple(basis @ axis)))
+                q = basis.to_quaternion() @ frame
+                writes.extend((node, field, value)
+                              for field, value in angle_limits.frame_values(q).items())
         for collider in self.project.colliders:
             name = collider.bone_name
             # Unbound colliders live in armature-object space.
@@ -97,7 +105,8 @@ class RestPoseEdit:
             else:
                 b = inverse @ posed @ Vector(collider.b)
             writes.append((collider, 'b', tuple(b)))
-        if not all(math.isfinite(v) for _, _, values in writes for v in values):
+        if not all(math.isfinite(v) for _, _, values in writes
+                   if not isinstance(values, (str, bool)) for v in values):
             raise ownership.HD2PBError("姿态转换产生非有限物理坐标")
         try:
             with preview.suspend_updates():

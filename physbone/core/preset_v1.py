@@ -26,7 +26,8 @@ ENTITY_NODE = "NODE"
 ENTITY_COLLIDER = "COLLIDER"
 ENTITY_CHAIN_LINK = "CHAIN_LINK"
 ENTITY_TYPES = frozenset({ENTITY_PROFILE, ENTITY_NODE, ENTITY_COLLIDER, ENTITY_CHAIN_LINK})
-NODE_DIRECTION_FIELDS = frozenset({"limit_axis", "reference_mode", "reference_direction", "reference_frame"})
+NODE_DIRECTION_FIELDS = frozenset({"limit_axis", "limit_frame", "limit_frame_valid",
+                                   "reference_mode", "reference_direction", "reference_frame"})
 
 PRESET_UNITS = {
     "angle": "radian",
@@ -155,9 +156,12 @@ def _validate_node(parameters: Mapping[str, object]) -> dict[str, object]:
     )
     reference_fields = frozenset({'reference_mode','reference_direction','reference_frame'})
     has_reference = bool(reference_fields.intersection(parameters))
+    frame_fields = frozenset({'limit_frame', 'limit_frame_valid'})
+    has_frame = bool(frame_fields.intersection(parameters))
     collision_fields = frozenset({'override_collision_filter','group_mask','collision_mask'})
     has_collision = bool(collision_fields.intersection(parameters))
     _exact_keys(parameters, expected | (reference_fields if has_reference else frozenset())
+                | (frame_fields if has_frame else frozenset())
                 | (collision_fields if has_collision else frozenset()), "parameters")
     kind = _enum(parameters["limit_kind"], "parameters.limit_kind", _LIMIT_KINDS)
     axis = _vec3(parameters["limit_axis"], "parameters.limit_axis")
@@ -188,8 +192,17 @@ def _validate_node(parameters: Mapping[str, object]) -> dict[str, object]:
             100.0,
         ),
     }
+    if has_frame:
+        valid = _boolean(parameters['limit_frame_valid'], 'parameters.limit_frame_valid')
+        raw_frame = parameters['limit_frame']
+        if not isinstance(raw_frame, (list, tuple)) or len(raw_frame) != 4:
+            raise PresetError('parameters.limit_frame 必须是 XYZW 四元数')
+        frame = [_number(v, 'parameters.limit_frame', -1.0, 1.0) for v in raw_frame]
+        if valid and sum(v * v for v in frame) < 1e-12:
+            raise PresetError('角限姿态四元数不能为零')
+        result.update(limit_frame=frame, limit_frame_valid=valid)
     if has_reference:
-        mode = _enum(parameters['reference_mode'],'parameters.reference_mode',frozenset({'ANIMATED_SEGMENT','EXPLICIT_LOCAL','EXPLICIT_FRAME'}))
+        mode = _enum(parameters['reference_mode'],'parameters.reference_mode',frozenset({'ANIMATED_SEGMENT','PARENT_REST','EXPLICIT_LOCAL','EXPLICIT_FRAME'}))
         direction = _vec3(parameters['reference_direction'],'parameters.reference_direction')
         if any(abs(v) > 1.0 for v in direction):
             raise PresetError('parameters.reference_direction 各分量必须位于 -1 到 1，避免写入时被截断')
@@ -197,7 +210,7 @@ def _validate_node(parameters: Mapping[str, object]) -> dict[str, object]:
         if not isinstance(raw_frame,(list,tuple)) or len(raw_frame) != 4:
             raise PresetError('parameters.reference_frame 必须是 XYZW 四元数')
         frame = [_number(v,'parameters.reference_frame',-1.0,1.0) for v in raw_frame]
-        if kind == 'NONE' and mode != 'ANIMATED_SEGMENT':
+        if kind == 'NONE' and mode != 'ANIMATED_SEGMENT' and not result.get('limit_frame_valid'):
             raise PresetError('无角限节点不能声明自定义参考方向')
         if mode == 'EXPLICIT_LOCAL' and _length_squared(direction) < 1e-12:
             raise PresetError('显式参考方向不能为零')
@@ -294,6 +307,11 @@ def merge_parameters(entity_type, current, incoming, *, node_mode="NUMERIC"):
     else:
         result.update({key: value for key, value in source.items()
                        if (key in NODE_DIRECTION_FIELDS) == (node_mode == "DIRECTION")})
+    if (entity_type == ENTITY_NODE and node_mode in {'ALL', 'DIRECTION'}
+            and 'reference_mode' in source and 'limit_frame' not in source
+            and 'limit_frame_valid' in result):
+        # A legacy direction preset must not be shadowed by the target's newer frame.
+        result['limit_frame_valid'] = False
     try:
         return validate_parameters(entity_type, result)
     except PresetError as exc:

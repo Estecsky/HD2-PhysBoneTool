@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from mathutils import Matrix, Vector
-from . import ownership, preview
+from . import angle_limits, ownership, preview
 from .mmd_conversion import _uniform
 
 
@@ -51,6 +51,8 @@ def transfer_project(source, target, mapping, *, source_consumers=...):
         target['HD2PB_TransferPruningReport'] = json.dumps(pruning, ensure_ascii=False, sort_keys=True)
         return {'chains': 0, 'colliders': 0, 'scale': scale, 'pruning': pruning}
     values["authoring_object"], values["controller_collection"] = target, None
+    source_nodes = {node.uuid: (chain, index, node)
+                    for chain in src.chains for index, node in enumerate(chain.nodes)}
     def local_frame(name):
         src_rest = source.data.bones[name].matrix_local if name else Matrix.Identity(4)
         dst_rest = target.data.bones[mapping[name]].matrix_local if name else Matrix.Identity(4)
@@ -62,12 +64,10 @@ def transfer_project(source, target, mapping, *, source_consumers=...):
             node["radius"] *= scale
             if i:
                 basis = local_frame(old_nodes[i - 1]).to_3x3().normalized()
-                for field in ("limit_axis", "reference_direction"):
-                    node[field] = tuple(basis @ Vector(node[field]))
-                x, y, z, w = node["reference_frame"]
-                from mathutils import Quaternion
-                q = basis.to_quaternion() @ Quaternion((w, x, y, z))
-                node["reference_frame"] = (q.x, q.y, q.z, q.w)
+                source_chain, source_index, source_node = source_nodes[node['uuid']]
+                q = basis.to_quaternion() @ angle_limits.resolve_frame(source, source_chain, source_index)
+                node['limit_axis'] = tuple(basis @ angle_limits.resolve_axis(source_node))
+                node.update(angle_limits.frame_values(q))
     for collider in values["colliders"]:
         transform = local_frame(collider["bone_name"])
         collider["a"] = tuple(transform @ Vector(collider["a"]))

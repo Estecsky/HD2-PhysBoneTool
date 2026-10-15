@@ -125,7 +125,7 @@ PREVIEW_KIND_ITEMS = (
 
 LIMIT_KIND_ITEMS = (
     ("NONE", "无限制", "不限制摆动角度；仍保持相邻节点的静止段长度"),
-    ("CONE", "圆锥限制", "围绕当前动画父子段方向，用一个半角限制任意方向摆动"),
+    ("CONE", "圆锥限制", "围绕角限轴的朝向，用一个半角限制任意方向摆动；默认对齐静止骨段"),
     ("HINGE", "铰链限制", "以父骨局部限制轴作为铰链平面法线，并用主半角限制平面内摆动"),
     ("SPHERICAL", "椭圆球面限制", "把父骨局部限制轴投影为主方向，用两个半角限制主/正交摆动"),
 )
@@ -187,6 +187,12 @@ def _update_project_plane_geometry(item, _context):
 
 def _update_project_limit_preview(item, _context):
     _queue_preview_update(item, ENTITY_PROJECT, "LIMIT_PREVIEW")
+
+
+def _update_project_chain_display(item, _context):
+    # Only chain curves need different points/Hooks; all physics stays intact.
+    for chain in item.chains:
+        _queue_preview_update(chain, ENTITY_CHAIN, "GEOMETRY")
 
 
 def _filter_scene_project_owner(scene, obj):
@@ -267,13 +273,13 @@ def _update_node_limit(item, _context):
 
 
 def _update_node_limit_kind(item, _context):
-    # A user first enabling a limit gets the same outgoing-Rest alignment as
+    # A user first enabling a limit gets the same incoming-Rest alignment as
     # the explicit Align button. Bulk restore/import must retain authored axes.
     from . import preview
     if preview._SUSPEND_DEPTH == 0:
         if item.limit_kind == 'NONE':
             item.reference_mode = 'ANIMATED_SEGMENT'
-        elif item.reference_mode == 'ANIMATED_SEGMENT':
+        elif not item.limit_frame_valid and item.reference_mode == 'ANIMATED_SEGMENT':
             from .operators import _auto_align_new_limit
             _auto_align_new_limit(item)
     _update_node_limit(item, _context)
@@ -447,12 +453,13 @@ class HD2PB_Node(PropertyGroup):
         subtype="XYZ",
         description=(
             "父骨局部空间中的方向轴。铰链把它作为运动平面法线；椭圆球面会在运行时把它投影为"
-            "主方向。两种限制都要求非零；它不是编辑对象旋转，也不会从视图变换读取"
+            "主方向。两种限制都要求非零；旋转角限轴时会随完整角限姿态一起旋转"
         ),
         update=_update_node_limit,
     )
     reference_mode: EnumProperty(
-        name="角限参考方向模式",
+        name="旧版角限参考类型（兼容数据）",
+        options={"HIDDEN"},
         items=REFERENCE_MODE_ITEMS,
         default="ANIMATED_SEGMENT",
         description=(
@@ -463,6 +470,7 @@ class HD2PB_Node(PropertyGroup):
     )
     reference_direction: FloatVectorProperty(
         name="显式参考方向（父骨局部）",
+        options={"HIDDEN"},
         size=3,
         default=(0.0, 1.0, 0.0),
         min=-1.0,
@@ -476,6 +484,7 @@ class HD2PB_Node(PropertyGroup):
     )
     reference_frame: FloatVectorProperty(
         name="显式参考坐标架（四元数 XYZW）",
+        options={"HIDDEN"},
         size=4,
         default=(0.0, 0.0, 0.0, 1.0),
         min=-1.0,
@@ -485,6 +494,16 @@ class HD2PB_Node(PropertyGroup):
             "仅用于“显式参考坐标架”模式。按 XYZW 填写父骨局部主动旋转四元数，+Y 为前向轴；"
             "导出时会规范化并固定 q/-q 符号"
         ),
+        update=_update_node_reference,
+    )
+    limit_frame: FloatVectorProperty(
+        name="角限完整姿态（XYZW）", size=4, default=(0.0, 0.0, 0.0, 1.0),
+        options={"HIDDEN"}, update=_update_node_reference,
+        description="前一节点骨局部的完整旋转；+Z 指向受限骨段，保留滚转",
+    )
+    limit_frame_valid: BoolProperty(
+        name="已保存角限姿态", default=False, options={"HIDDEN"},
+        description="标记已保存完整旋转；未保存的旧工程只读解析兼容方向",
         update=_update_node_reference,
     )
     override_collision_filter: BoolProperty(
@@ -569,8 +588,8 @@ class HD2PB_Chain(PropertyGroup):
     )
     local_bend: BoolProperty(
         name="逐节局部弯曲",
-        default=False,
-        description="弹性平衡和角度限制跟随上一段的模拟方向，适用于长发、飘带和衣摆；关闭则保留全局动画参考",
+        default=True,
+        description="弹性平衡和角度限制跟随上一段的模拟方向，适用于长发、飘带和衣摆；关闭则跟随全局动画参考",
     )
     nodes: CollectionProperty(
         name="链节点",
@@ -890,6 +909,12 @@ class HD2PB_Project(PropertyGroup):
         description="显示每条物理骨链按节点顺序连接的彩色 Group 曲线",
         update=_update_project_style,
     )
+    preview_show_full_chain: BoolProperty(
+        name="显示实际完整骨链",
+        default=False,
+        description="将起始驱动骨头部加入骨链曲线，显示驱动骨到首模拟节点的实际连接；仅改变预览，不增加模拟节点或影响导出",
+        update=_update_project_chain_display,
+    )
     preview_show_nodes: BoolProperty(
         name="显示节点半径实体",
         default=False,
@@ -911,7 +936,13 @@ class HD2PB_Project(PropertyGroup):
     preview_show_limits: BoolProperty(
         name="显示角度限制",
         default=True,
-        description="显示使用 HD2 Cone、Hinge 或 Spherical 数学生成的允许方向边界",
+        description="显示普通模拟骨段的 Cone、Hinge 或 Spherical 允许方向边界；起始驱动骨处的首段角限由独立开关控制",
+        update=_update_project_style,
+    )
+    preview_show_driver_limits: BoolProperty(
+        name="显示起始驱动骨角度限制",
+        default=False,
+        description="独立显示位于起始驱动骨处的首段角限及旋转轴，不受普通角度限制开关控制；仍受预览总开关和隔离控制，不改变物理约束",
         update=_update_project_style,
     )
     preview_show_colliders: BoolProperty(

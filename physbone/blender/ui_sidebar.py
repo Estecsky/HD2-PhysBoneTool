@@ -428,6 +428,13 @@ class HD2PB_PT_sidebar_object(Panel):
             text="当前 / 所选骨链对齐受限骨段…",
             icon="ORIENTATION_LOCAL",
         )
+        remove_limits = batch.column()
+        remove_limits.enabled = entity_type == properties.ENTITY_CHAIN
+        remove_limits.operator(
+            "hd2pb.remove_chain_limits",
+            text="移除当前 / 所选骨链角限…",
+            icon="X",
+        )
         lists = layout.box()
         lists.label(text="项目内容导航（列表默认折叠）", icon="OUTLINER")
         _draw_collapsible_list(
@@ -587,8 +594,16 @@ class HD2PB_PT_sidebar_object_preview(Panel):
             row = visibility.row(align=True)
             row.prop(project, shown)
             toggle = row.row(align=True)
-            toggle.enabled = getattr(project, shown)
+            toggle.enabled = getattr(project, shown) or (
+                shown == "preview_show_limits" and project.preview_show_driver_limits
+            )
             toggle.prop(project, xray, text="穿透")
+            if shown == "preview_show_limits":
+                visibility.prop(project, "preview_show_driver_limits")
+            elif shown == "preview_show_chains":
+                full_chain = visibility.row()
+                full_chain.enabled = project.preview_show_chains
+                full_chain.prop(project, "preview_show_full_chain")
         visibility.prop(project, "preview_show_node_names")
         visibility.prop(project, "preview_show_collider_names")
         visibility.prop(project, "preview_allow_collider_transform")

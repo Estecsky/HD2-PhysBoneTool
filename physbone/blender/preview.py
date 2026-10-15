@@ -17,10 +17,9 @@ import time
 
 import bpy
 from bpy.app.handlers import persistent
-from mathutils import Matrix, Vector
+from mathutils import Euler, Matrix, Vector
 
-from ..core import reference as core_reference
-from . import ownership, preview_geometry, preview_nodes, properties
+from . import angle_limits, ownership, preview_geometry, preview_nodes, properties
 from . import preview_layers
 
 
@@ -720,6 +719,12 @@ def _visible(project, obj):
         properties.PREVIEW_LINK_COLLISION: project.preview_show_link_collisions,
         properties.PREVIEW_COLLIDER_ENDPOINT: project.preview_show_colliders,
     }.get(obj.hd2pb_preview_kind, False)
+    if obj.hd2pb_preview_kind in {properties.PREVIEW_NODE_LIMIT, properties.PREVIEW_NODE_LIMIT_AXIS}:
+        found = ownership.find_entity(project, properties.ENTITY_NODE, obj.hd2pb_entity_uuid)
+        if found is not None:
+            node, chain = found
+            if len(chain.nodes) > 1 and chain.nodes[1].uuid == node.uuid:
+                category = project.preview_show_driver_limits
     if not category:
         return False
     isolated = _effective_isolation_uuid(project)
@@ -951,10 +956,10 @@ def _apply_spec(obj, spec, owner, project, material, *, sync_hooks=False):
 
 
 def _attach_preview_object(obj, logical_parent, owner, spec):
-    """把普通 helper 挂到 controller，把角限 helper 直接挂到当前节点骨骼。"""
+    """普通 helper 跟随 controller；角限实体跟随其可编辑旋转轴。"""
 
     obj.matrix_parent_inverse = Matrix.Identity(4)
-    if spec.parent_bone:
+    if spec.parent_bone and spec.gn_kind != "LIMIT":
         bone = owner.data.bones.get(spec.parent_bone)
         if bone is None:
             raise ownership.HD2PBError(
@@ -1028,9 +1033,8 @@ def _new_preview_object(
 def _new_limit_axis_object(collection, owner, project, node, spec, stage, *, chain_uuid=""):
     """创建 RE Chain 风格的可选角限旋转轴 Empty。
 
-    这是制作期派生对象：位置和缩放由当前 Node 骨骼绑定固定，仅旋转用于
-    调整视口中角限实体的朝向。当前轴旋转仍属于制作期预览，只有后续明确应用
-    到 HD2PHY1 参考方向时才会改变 canonical 数据。
+    锥顶固定在受限骨段起点，绑定前一节点；旋转立即保存完整 canonical
+    姿态，包括滚转，供刷新、重建、保存及导出使用。
     """
 
     name = f"{_safe_label(node.bone_name, '缺失骨骼')} · 角限轴"
@@ -1052,11 +1056,11 @@ def _new_limit_axis_object(collection, owner, project, node, spec, stage, *, cha
         obj.hide_render = True
         obj.hide_select = False
         obj.show_name = False
-        bone = owner.data.bones.get(node.bone_name)
+        bone = owner.data.bones.get(spec.parent_bone)
         if bone is None:
             raise ownership.HD2PBError(f"角限旋转轴引用的骨骼“{node.bone_name}”不存在")
         from . import binding
-        binding.attach(obj, owner, node.bone_name)
+        binding.attach(obj, owner, spec.parent_bone)
         obj.rotation_mode = "XYZ"
         obj.rotation_euler = spec.axis_rotation
         obj.scale = (1.0, 1.0, 1.0)
@@ -1120,15 +1124,26 @@ def _capture_limit_axis_reference(axis):
         if previous_bone is None or current_bone is None:
             return False
         axis.rotation_mode = "XYZ"
-        direction_current = axis.rotation_euler.to_matrix() @ Vector((0.0, 0.0, 1.0))
-        direction_owner = current_bone.matrix_local.to_3x3() @ direction_current
-        direction_parent = previous_bone.matrix_local.to_3x3().inverted_safe() @ direction_owner
-        if direction_parent.length <= 1.0e-6:
-            return False
-        direction_parent.normalize()
+        from . import binding
+        local_frame = axis.rotation_euler.to_quaternion()
+        old_frame = angle_limits.resolve_frame(owner, chain, index)
+        if binding.matches(axis, owner, node.bone_name):
+            # Old helper attached to the end node. Convert its full Rest frame
+            # once, never recover orientation from sheared world matrices.
+            basis = (previous_bone.matrix_local.to_quaternion().inverted()
+                     @ current_bone.matrix_local.to_quaternion())
+            local_frame = basis @ local_frame
+            base = tuple(axis.get("hd2pb_limit_axis_base_rotation", ()))
+            if len(base) != 3:
+                return False
+            old_frame = basis @ Euler(base, "XYZ").to_quaternion()
+        physical_axis = angle_limits.resolve_axis(node)
+        if node.limit_kind in {"HINGE", "SPHERICAL"}:
+            physical_axis = local_frame @ old_frame.inverted() @ physical_axis
         with suspend_updates():
-            node.reference_direction = tuple(float(value) for value in direction_parent)
-            node.reference_mode = "EXPLICIT_LOCAL"
+            node.limit_axis = tuple(physical_axis)
+            for name, value in angle_limits.frame_values(local_frame).items():
+                setattr(node, name, value)
         axis["hd2pb_limit_axis_base_rotation"] = tuple(
             float(value) for value in axis.rotation_euler
         )
@@ -1138,18 +1153,19 @@ def _capture_limit_axis_reference(axis):
 
 
 def _sync_limit_axis_object(obj, owner, project, node, spec):
-    """更新轴 Empty 的绑定和默认姿态，保留用户已经旋转的试摆结果。"""
+    """更新轴 Empty，完整旋转直接来自已保存的制作姿态。"""
 
     if obj.type != "EMPTY":
         raise ownership.HD2PBError(f"角限旋转轴“{obj.name}”必须是 Empty")
-    if not _axis_rotation_changed(obj):
+    from . import binding
+    legacy_binding = binding.matches(obj, owner, node.bone_name)
+    if legacy_binding or not _axis_rotation_changed(obj):
         obj.rotation_mode = "XYZ"
         obj.rotation_euler = spec.axis_rotation
-    bone = owner.data.bones.get(node.bone_name)
+    bone = owner.data.bones.get(spec.parent_bone)
     if bone is None:
         raise ownership.HD2PBError(f"角限旋转轴引用的骨骼“{node.bone_name}”不存在")
-    from . import binding
-    binding.attach(obj, owner, node.bone_name, preserve_legacy=True)
+    binding.attach(obj, owner, spec.parent_bone, preserve_legacy=True)
     obj.empty_display_type = "ARROWS"
     obj.empty_display_size = max(node_display_radius(node.radius), 0.04)
     obj.lock_location = (True, True, True)
@@ -1170,11 +1186,13 @@ def _rest_head(owner, bone_name):
 
 
 def _chain_curve_payload(owner, chain):
-    """只投影模拟节点；单节点链用该骨自身方向保留一个可选择 Curve。"""
+    """按显示选项包含驱动头部；单模拟节点仍保留可选择的短曲线。"""
 
     simulated = list(chain.nodes)[1:]
     if not simulated:
         raise ownership.HD2PBError("骨链没有可投影的模拟节点")
+    if owner.data.hd2pb_project.preview_show_full_chain:
+        simulated = list(chain.nodes)
     points = [_rest_head(owner, node.bone_name) for node in simulated]
     hooks = [node.bone_name for node in simulated]
     if len(points) == 1:
@@ -1306,35 +1324,17 @@ def _limit_spec(owner, chain, node_index, preview_height=None):
     current_bone = owner.data.bones.get(node.bone_name)
     if previous_bone is None or current_bone is None:
         raise ownership.HD2PBError("角限预览引用的骨骼已经不存在")
-    # 视觉轴在 Rest Pose 中冻结为当前 Node 的局部方向；随后由当前 Node 的
-    # Bone Parent 完整驱动动画姿态。若用每帧 Pose 反算局部轴，当前骨自身
-    # 的旋转会被逆变换抵消，正是“圆锥不跟骨骼旋转”的根因。
+    # The constraint belongs to the previous -> current segment, so its apex
+    # and animation binding belong to the previous bone, not the endpoint.
     delta = (
         Vector(current_bone.matrix_local.translation)
         - Vector(previous_bone.matrix_local.translation)
     )
-    node_basis = current_bone.matrix_local.to_3x3()
     length = float(delta.length)
     if not math.isfinite(length) or length <= 1.0e-6:
         raise ownership.HD2PBError("角限预览所在骨段长度接近零")
-    parent_rest_local = previous_bone.matrix_local.to_3x3().inverted_safe() @ delta
-    try:
-        reference_parent_local = Vector(
-            core_reference.resolve_reference_forward(
-                getattr(node, "reference_mode", "ANIMATED_SEGMENT"),
-                animated_segment=parent_rest_local,
-                parent_rest=parent_rest_local,
-                explicit_local=getattr(node, "reference_direction", (0.0, 1.0, 0.0)),
-                explicit_frame=getattr(node, "reference_frame", (0.0, 0.0, 0.0, 1.0)),
-            )
-        )
-    except core_reference.ReferenceError as exc:
-        raise ownership.HD2PBError(f"角限参考方向无效：{exc}") from exc
-    desired_owner = previous_bone.matrix_local.to_3x3() @ reference_parent_local
-    desired_local = node_basis.inverted_safe() @ desired_owner
-    local_length = float(desired_local.length)
-    if not math.isfinite(local_length) or local_length <= 1.0e-6:
-        raise ownership.HD2PBError("角限预览无法转换到当前节点骨骼局部空间")
+    local_rotation = angle_limits.resolve_frame(owner, chain, node_index)
+    desired_local = local_rotation @ Vector((0, 0, 1))
     if node.limit_kind == "CONE" and preview_height is not None:
         # 只有立体 Cone 使用项目级显示高度；Hinge/Spherical 的扇区长度
         # 继续由当前骨段比例决定，避免“圆锥高度”误改其他角限形状。
@@ -1350,18 +1350,9 @@ def _limit_spec(owner, chain, node_index, preview_height=None):
         display_length = max(length * 0.8, 0.02)
     reference_local = None
     if node.limit_kind in {"HINGE", "SPHERICAL"}:
-        reference_local = Vector(tuple(node.limit_axis))
-        # canonical limit_axis 位于前一骨的 Rest 局部空间；当前节点作为
-        # helper 宿主时，转换到当前 Node 的 Rest 局部空间。
-        reference_local = (
-            current_bone.matrix_local.to_3x3().inverted_safe()
-            @ (previous_bone.matrix_local.to_3x3() @ reference_local)
-        )
-    # Mesh Cone 的轴是局部 +Z。精确边界先在 desired 轴空间构造，再旋回 +Z，
-    # 最终由 Object 的局部 rotation 对齐；当前骨骼父级负责位置和动画姿态。
-    desired_unit = Vector(desired_local)
-    desired_unit.normalize()
-    local_rotation = Vector((0.0, 0.0, 1.0)).rotation_difference(desired_unit)
+        reference_local = angle_limits.resolve_axis(node)
+    # Exact boundaries live in preceding-bone local space. Undo the FULL
+    # frame for helper-local geometry, retaining authored roll on the object.
     inverse_rotation = local_rotation.inverted()
     try:
         exact = preview_geometry.make_limit(
@@ -1400,8 +1391,7 @@ def _limit_spec(owner, chain, node_index, preview_height=None):
             ("Cone Radius", cone_radius),
             ("Cone Depth", display_length),
         ),
-        # Curve 宿主挂在可选角限轴 Empty 下；轴 Empty 承担骨骼绑定和默认
-        # Rest 姿态旋转，用户旋转该 Empty 时只改变视口角限范围。
+        parent_bone=previous_node.bone_name,
         axis_rotation=tuple(float(value) for value in local_rotation.to_euler("XYZ")),
     )
 
@@ -1759,7 +1749,13 @@ def _validate_limit_axis_for_update(index, obj):
         raise ownership.HD2PBError(f"角限旋转轴“{obj.name}”必须是无数据 Empty")
     from . import binding
     result = ownership.find_entity(project, properties.ENTITY_NODE, obj.hd2pb_entity_uuid)
-    if result is None or not binding.matches(obj, owner, result[0].bone_name):
+    if result is None:
+        raise ownership.HD2PBError(f"角限旋转轴“{obj.name}”没有对应节点")
+    node, chain = result
+    position = next((i for i, item in enumerate(chain.nodes) if item.uuid == node.uuid), -1)
+    # Accept exact old endpoint bindings solely for in-place projection repair.
+    if position <= 0 or not any(binding.matches(obj, owner, name) for name in
+                               (chain.nodes[position - 1].bone_name, node.bone_name)):
         raise ownership.HD2PBError(f"角限旋转轴“{obj.name}”骨骼跟随损坏；请重建编辑对象")
     if tuple(obj.lock_location) != (True, True, True):
         raise ownership.HD2PBError(f"角限旋转轴“{obj.name}”的位置必须锁定")
@@ -2573,7 +2569,7 @@ def _chain_hook_issues(obj, owner, chain=None, *, expected_bones=None):
     ]
     if len(managed) != len(expected_bones):
         return [
-            f"骨链曲线“{obj.name}”应有 {len(expected_bones)} 个模拟骨 Hook，当前为 {len(managed)} 个"
+            f"骨链曲线“{obj.name}”应有 {len(expected_bones)} 个显示骨 Hook，当前为 {len(managed)} 个"
         ]
     nodes_positions = [
         position
@@ -2707,13 +2703,13 @@ def preview_issues(owner):
             if node.limit_kind != "NONE":
                 expected[
                     (properties.ENTITY_NODE, node.uuid, properties.PREVIEW_NODE_LIMIT_AXIS)
-                ] = ((properties.ENTITY_NODE, node.uuid), chain.uuid, node.bone_name)
+                ] = ((properties.ENTITY_NODE, node.uuid), chain.uuid, chain.nodes[node_index - 1].bone_name)
                 expected[
                     (properties.ENTITY_NODE, node.uuid, properties.PREVIEW_NODE_LIMIT)
                 ] = (
                     (properties.ENTITY_NODE, node.uuid),
                     chain.uuid,
-                    node.bone_name,
+                    chain.nodes[node_index - 1].bone_name,
                 )
     for collider in project.colliders:
         expected[
@@ -2845,7 +2841,7 @@ def preview_issues(owner):
                             )
                         ):
                             issues.append(
-                                f"预览对象“{obj.name}”没有把锥顶吸附到当前节点骨骼“{parent_bone}”"
+                                f"预览对象“{obj.name}”没有把锥顶吸附到受限骨段起点“{parent_bone}”"
                             )
                     elif obj.parent != controllers[0] or obj.parent_type != "OBJECT":
                         issues.append(f"预览对象“{obj.name}”没有挂到预期 controller")
@@ -3341,6 +3337,18 @@ def _rebuild_known_owners(*, queue_style):
             _REST_SIGNATURES[owner.as_pointer()] = _limit_rest_signature(owner)
             if queue_style:
                 _queue(owner, properties.ENTITY_PROJECT, project.project_uuid, ASPECT_STYLE)
+                # Upgrade only exact, untouched old endpoint-bound projections.
+                # Canonical data stays read-only; no collection/node-group rebuild.
+                from . import binding
+                preview_index = build_project_index(owner)
+                for chain in project.chains:
+                    for node in list(chain.nodes)[1:]:
+                        axes = preview_index["previews"].get(
+                            (properties.ENTITY_NODE, node.uuid, properties.PREVIEW_NODE_LIMIT_AXIS), ())
+                        if (node.limit_kind != "NONE" and len(axes) == 1
+                                and not _axis_rotation_changed(axes[0])
+                                and binding.matches(axes[0], owner, node.bone_name)):
+                            _queue(owner, properties.ENTITY_NODE, node.uuid, ASPECT_REFERENCE)
 
 
 @persistent

@@ -14,7 +14,7 @@ from bpy_extras.io_utils import ExportHelper, ImportHelper
 from mathutils import Vector
 
 from ..core import preset_v1
-from . import adapter_v1, controllers, ownership, preview, properties
+from . import adapter_v1, angle_limits, controllers, ownership, preview, properties
 
 
 _PARAMETER_CLIPBOARD = None
@@ -26,7 +26,7 @@ _TYPED_PRESET_ENUM_NUMBERS = {}
 _NODE_APPLY_MODES = (
     ("NUMERIC", "仅数值（保留目标方向）", "保留限制轴与参考方向；不兼容的限制类型会拒绝，不自动改方向"),
     ("ALL", "包含方向", "复制全部节点参数；方向属于父骨局部坐标，不做跨骨坐标换算"),
-    ("DIRECTION", "仅方向", "仅复制限制轴与参考模式／方向／坐标架，其他参数保持不变"),
+    ("DIRECTION", "仅方向", "仅复制限制轴与完整角限姿态，其他参数保持不变"),
 )
 _CHAIN_SCOPES = (
     ("CURRENT", "当前骨链／节点", "只修改当前实体"),
@@ -331,6 +331,8 @@ _NODE_FIELDS = (
     "reference_mode",
     "reference_direction",
     "reference_frame",
+    "limit_frame",
+    "limit_frame_valid",
 )
 _CHAIN_FIELDS = (
     "uuid",
@@ -375,8 +377,10 @@ _PROJECT_AUTHORING_FIELDS = (
     "new_chain_auto_tail",
     "preview_enabled",
     "preview_show_chains",
+    "preview_show_full_chain",
     "preview_show_nodes",
     "preview_show_limits",
+    "preview_show_driver_limits",
     "preview_show_colliders",
     "preview_show_chain_links",
     "preview_show_link_collisions",
@@ -1217,7 +1221,7 @@ class HD2PB_OT_append_tail_helper(Operator):
             bpy.ops.object.mode_set(mode="OBJECT")
             with preview.suspend_updates():
                 previous = chain.nodes[-1]
-                values = {k: tuple(getattr(previous, k)) if k in ("limit_axis", "reference_direction", "reference_frame")
+                values = {k: tuple(getattr(previous, k)) if k in ("limit_axis", "reference_direction", "reference_frame", "limit_frame")
                           else getattr(previous, k) for k in _NODE_FIELDS if k not in ("uuid", "bone_name")}
                 node = chain.nodes.add();added_node = True
                 node.uuid = ownership.new_uuid();node.bone_name = helper_name
@@ -2218,6 +2222,8 @@ def _parameter_fields(entity_type):
             "reference_mode",
             "reference_direction",
             "reference_frame",
+            "limit_frame",
+            "limit_frame_valid",
         ),
         properties.ENTITY_COLLIDER: ("kind", "group_mask", "collision_mask", "inside", "a", "b", "radius"),
         properties.ENTITY_CHAIN_LINK: ("coupling", "max_correction"),
@@ -2225,22 +2231,34 @@ def _parameter_fields(entity_type):
     return fields.get(entity_type)
 
 
-def _parameter_payload(entity_type, entity):
+def _parameter_payload(entity_type, entity, *, resolved=False):
     fields = _parameter_fields(entity_type)
     if fields is None:
         raise ownership.HD2PBError("当前实体不支持复制或保存物理参数预设")
-    return {
+    values = {
         name: list(value) if not isinstance(value, (str, int, float, bool)) else value
         for name in fields
         for value in (getattr(entity, name),)
     }
+    if resolved and entity_type == properties.ENTITY_NODE:
+        owner, chain, index = angle_limits.node_context(entity)
+        frame = (angle_limits.resolve_frame(owner, chain, index)
+                 if index or entity.limit_frame_valid or entity.reference_mode in {'EXPLICIT_LOCAL', 'EXPLICIT_FRAME'}
+                 else angle_limits.frame_from_direction((0, 1, 0)))
+        values.update(angle_limits.frame_values(frame))
+        values['limit_axis'] = list(angle_limits.resolve_axis(entity))
+        # New clipboard/preset documents expose one complete pose, not legacy modes.
+        for name in ('reference_mode', 'reference_direction', 'reference_frame'):
+            values.pop(name)
+    return values
 
 
 def _apply_parameter_payload(entity_type, entity, parameters):
     normalized = preset_v1.validate_parameters(entity_type, parameters)
     for name, value in normalized.items():
         setattr(entity, name, value)
-    if entity_type == properties.ENTITY_NODE and 'reference_mode' not in normalized:
+    if (entity_type == properties.ENTITY_NODE and 'reference_mode' not in normalized
+            and 'limit_frame' not in normalized):
         if entity.limit_kind == 'NONE':
             entity.reference_mode = 'ANIMATED_SEGMENT'
         elif entity.reference_mode == 'ANIMATED_SEGMENT':
@@ -2587,7 +2605,7 @@ def _apply_parameter_batch(owner, entity_type, targets, incoming, *, node_mode="
         for target, values in zip(targets, prepared):
             _node, chain = ownership.find_entity(project, entity_type, target.uuid)
             if (not chain.root_swing and chain.nodes[0].uuid == target.uuid
-                    and (values['limit_kind'] != 'NONE' or values.get('reference_mode') != 'ANIMATED_SEGMENT'
+                    and (values['limit_kind'] != 'NONE'
                          or values.get('override_collision_filter'))):
                 raise ownership.HD2PBError('固定驱动节点不能应用模拟角限或独立碰撞过滤；整批未修改')
     try:
@@ -2623,7 +2641,7 @@ class HD2PB_OT_copy_entity_parameters(Operator):
             _owner, _project, entity_type, entity, _parent = _current_parameter_entity(context)
             _PARAMETER_CLIPBOARD = {
                 "entity_type": entity_type,
-                "parameters": _parameter_payload(entity_type, entity),
+                "parameters": _parameter_payload(entity_type, entity, resolved=True),
             }
             labels = {
                 properties.ENTITY_PROFILE: "弹簧参数配置",
@@ -2728,7 +2746,7 @@ class HD2PB_OT_save_preset(Operator):
                 directory,
                 self.preset_name,
                 entity_type,
-                _parameter_payload(entity_type, entity),
+                _parameter_payload(entity_type, entity, resolved=True),
             )
             _select_library_preset(context, entity_type, path.name[:-len(preset_v1.PRESET_SUFFIX)])
             self.report({"INFO"}, f"已原子保存物理参数预设“{path.name}”")
@@ -3094,8 +3112,9 @@ class HD2PB_OT_apply_limit_ramp(Operator):
                         continue
                     values = dict(limit_kind='CONE', limit_angle=min(angle_step * index, self.max_angle_limit))
                     if self.align_to_next:
-                        values.update(reference_direction=list(_aligned_reference_direction(owner, chain, index)),
-                                      reference_mode="EXPLICIT_LOCAL")
+                        values.update(angle_limits.frame_values(angle_limits.frame_from_direction(
+                            _aligned_reference_direction(owner, chain, index))))
+                        values['limit_axis'] = list(angle_limits.resolve_axis(node))
                     changes.append((node, values))
             _commit_node_updates(owner, changes)
             self.report(
@@ -3104,6 +3123,49 @@ class HD2PB_OT_apply_limit_ramp(Operator):
                 + ("已对齐实际受限入段；整批已校验。"
                    if self.align_to_next else "保留手动方向。"),
             )
+            return {"FINISHED"}
+        except Exception as exc:
+            return _cancel(self, exc)
+
+
+class HD2PB_OT_remove_chain_limits(Operator):
+    """清除指定骨链所有节点的角限，保留其它物理参数与调校值。"""
+
+    bl_idname = "hd2pb.remove_chain_limits"
+    bl_label = "移除骨链角限"
+    bl_description = "将当前或所选同项目骨链的全部节点设为无角度限制；可撤销"
+    bl_options = {"REGISTER", "UNDO"}
+    scope: EnumProperty(
+        name="应用范围", description="只处理当前骨链或明确选中的同项目骨链，空选区不会处理全部链",
+        items=(("CURRENT", "当前骨链", "处理活动骨链的全部节点"),
+               ("SELECTED_CHAINS", "所选同项目骨链", "处理选中的同项目骨链")),
+        default="CURRENT",
+    )
+
+    @classmethod
+    def poll(cls, context):
+        return HD2PB_OT_apply_limit_ramp.poll(context)
+
+    def invoke(self, context, _event):
+        return context.window_manager.invoke_props_dialog(self, width=460)
+
+    def draw(self, context):
+        self.layout.prop(self, "scope")
+        try:
+            _owner, rows = _chain_operation_targets(context, self.scope)
+            count = sum(len(nodes) for _chain, nodes in rows)
+            self.layout.label(text=f"将移除 {len(rows)} 条骨链、{count} 个节点的角限（含起始节点）")
+            self.layout.label(text="保留骨链、碰撞和弹簧参数；此操作可撤销", icon="INFO")
+        except Exception as exc:
+            self.layout.label(text=str(exc), icon="ERROR")
+
+    def execute(self, context):
+        try:
+            owner, rows = _chain_operation_targets(context, self.scope)
+            changes = [(node, dict(limit_kind="NONE", reference_mode="ANIMATED_SEGMENT"))
+                       for _chain, nodes in rows for _index, node in nodes]
+            _commit_node_updates(owner, changes)
+            self.report({"INFO"}, f"已移除 {len(rows)} 条骨链、{len(changes)} 个节点的角限。")
             return {"FINISHED"}
         except Exception as exc:
             return _cancel(self, exc)
@@ -3188,11 +3250,13 @@ def _auto_align_new_limit(node):
                 return
             try:
                 direction = _aligned_reference_direction(project.authoring_object,chain,index)
-                axis = None if node.limit_kind == 'CONE' or index >= len(chain.nodes)-1 else _aligned_limit_axis(project.authoring_object,chain,index)
+                axis = (tuple(angle_limits.resolve_axis(node))
+                        if node.limit_kind == 'CONE' or index >= len(chain.nodes)-1
+                        else _aligned_limit_axis(project.authoring_object,chain,index))
                 with preview.suspend_updates():
-                    node.reference_direction = direction
-                    node.reference_mode = 'EXPLICIT_LOCAL'
-                    if axis is not None: node.limit_axis = axis
+                    for name, value in angle_limits.frame_values(angle_limits.frame_from_direction(direction)).items():
+                        setattr(node, name, value)
+                    node.limit_axis = axis
             except ownership.HD2PBError:
                 # Incomplete/degenerate data stays editable; strict validation
                 # still reports it when the user checks or exports the project.
@@ -3243,8 +3307,9 @@ class HD2PB_OT_align_limit_to_next(Operator):
                         if not batch:
                             raise ownership.HD2PBError("当前节点是固定驱动、末端方向轴或无限制，不能自动对齐")
                         continue
-                    values = dict(reference_direction=list(_aligned_reference_direction(owner, chain, index)),
-                                  reference_mode='EXPLICIT_LOCAL')
+                    values = angle_limits.frame_values(angle_limits.frame_from_direction(
+                        _aligned_reference_direction(owner, chain, index)))
+                    values['limit_axis'] = list(angle_limits.resolve_axis(node))
                     if node.limit_kind != 'CONE':
                         values['limit_axis'] = list(_aligned_limit_axis(owner, chain, index))
                     prepared.append((node, values))
@@ -3638,6 +3703,7 @@ CLASSES = (
     HD2PB_OT_import_preset,
     HD2PB_OT_open_preset_directory,
     HD2PB_OT_apply_limit_ramp,
+    HD2PB_OT_remove_chain_limits,
     HD2PB_OT_align_limit_to_next,
     HD2PB_OT_select_controller,
     HD2PB_OT_switch_mode,

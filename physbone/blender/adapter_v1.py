@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from .. import Gate
 from ..core import format_v1
-from . import ownership
+from . import angle_limits, ownership
 
 
 def _raise_issues(issues):
@@ -106,21 +106,9 @@ def authoring_document_from_object(owner):
                         "limit_axis": [float(value) for value in node.limit_axis],
                         "stiffness_scale": float(node.stiffness_scale),
                         "damping_scale": float(node.damping_scale),
-                        "reference_mode": str(getattr(node, "reference_mode", "ANIMATED_SEGMENT")),
-                        "reference_direction": [
-                            float(value)
-                            for value in getattr(
-                                node, "reference_direction", (0.0, 1.0, 0.0)
-                            )
-                        ],
-                        "reference_frame": [
-                            float(value)
-                            for value in getattr(
-                                node, "reference_frame", (0.0, 0.0, 0.0, 1.0)
-                            )
-                        ],
+                        **angle_limits.reference_fields(owner, chain, node_index),
                     }
-                    for node in chain.nodes
+                    for node_index, node in enumerate(chain.nodes)
                 ],
             }
         )
@@ -238,23 +226,9 @@ def project_document_from_object(owner):
                         "limit_axis": [float(value) for value in node.limit_axis],
                         "stiffness_scale": float(node.stiffness_scale),
                         "damping_scale": float(node.damping_scale),
-                        "reference_mode": str(
-                            getattr(node, "reference_mode", "ANIMATED_SEGMENT")
-                        ),
-                        "reference_direction": [
-                            float(value)
-                            for value in getattr(
-                                node, "reference_direction", (0.0, 1.0, 0.0)
-                            )
-                        ],
-                        "reference_frame": [
-                            float(value)
-                            for value in getattr(
-                                node, "reference_frame", (0.0, 0.0, 0.0, 1.0)
-                            )
-                        ],
+                        **angle_limits.reference_fields(owner, chain, node_index),
                     }
-                    for node in chain.nodes
+                    for node_index, node in enumerate(chain.nodes)
                 ],
             }
             for chain in project.chains
