@@ -1,6 +1,6 @@
 """HD2PhysBoneTool 的唯一版本源。"""
 
-VERSION = (0, 9, 3)
+VERSION = (0, 9, 4)
 PRERELEASE = ()
 # PRERELEASE = ("dev", 1)
 

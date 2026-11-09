@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 import os
 from pathlib import Path
@@ -23,6 +24,7 @@ _PRESET_ENUM_ROWS = []
 _PRESET_ENUM_STRING_POOL = []
 _TYPED_PRESET_ENUM_CACHE = {}
 _TYPED_PRESET_ENUM_NUMBERS = {}
+_EXPORT_TARGET_ENUM_CACHE = {}
 _NODE_APPLY_MODES = (
     ("NUMERIC", "仅数值（保留目标方向）", "保留限制轴与参考方向；不兼容的限制类型会拒绝，不自动改方向"),
     ("ALL", "包含方向", "复制全部节点参数；方向属于父骨局部坐标，不做跨骨坐标换算"),
@@ -44,6 +46,7 @@ def clear_runtime_state():
     _PRESET_ENUM_STRING_POOL.clear()
     _TYPED_PRESET_ENUM_CACHE.clear()
     _TYPED_PRESET_ENUM_NUMBERS.clear()
+    _EXPORT_TARGET_ENUM_CACHE.clear()
     from . import diagnostics, chain_profile_ops
     diagnostics.clear()
     chain_profile_ops.clear_runtime_state()
@@ -56,6 +59,7 @@ def runtime_state_present():
         or _PRESET_ENUM_ROWS
         or _PRESET_ENUM_STRING_POOL
         or _TYPED_PRESET_ENUM_CACHE
+        or _EXPORT_TARGET_ENUM_CACHE
         or diagnostics.present()
         or chain_profile_ops.runtime_state_present()
     )
@@ -2349,12 +2353,68 @@ def _operator_preset_set(self, value):
     self["_preset_choice_name"] = next((row[0] for row in rows if row[3] == value), rows[0][0])
 
 
-def _export_independent_update(sdk, context, owner, filepath=None):
+def _export_independent_update(sdk, context, owner, filepath=None, **targets):
     try:
-        return sdk.export_independent_physics_update(context, owner, filepath)
+        return sdk.export_independent_physics_updates(context, owner, filepath, **targets)
     except sdk.PhysicsPackagingError as exc:
         # SDK 制作检查属于可行动错误，不能被跨插件边界吞成“内部失败”。
         raise ownership.HD2PBError(str(exc)) from exc
+
+
+def _export_target_records(operator, domain):
+    records = json.loads(operator.target_snapshot or "[]")
+    return [record for record in records if record['content_domain'] == domain]
+
+
+def _export_target_items(operator, domain):
+    key = (operator.target_snapshot, domain)
+    if key not in _EXPORT_TARGET_ENUM_CACHE:
+        records = _export_target_records(operator, domain)
+        rows = [("__SELECT__", "请选择已保存目标" if records else "没有保存记录",
+                 "多个目标时请明确选择要更新的 Archive 与 Patch" if records
+                 else "请先用 AQSDK 保存该部位；加载 Patch 不会自动恢复保存记录", 0)]
+        for number, record in enumerate(records, 1):
+            rows.append((record['target_id'],
+                         f"{record['archive_name']} / {record['patch_name']}",
+                         record.get('patch_path') or "导出时自动查找已保存 Patch", number))
+        # Blender 动态枚举须保留字符串引用，直到插件禁用或工程重载。
+        _EXPORT_TARGET_ENUM_CACHE[key] = rows
+    return _EXPORT_TARGET_ENUM_CACHE[key]
+
+
+def _export_body_items(self, _context):
+    return _export_target_items(self, 'BODY')
+
+
+def _export_helmet_items(self, _context):
+    return _export_target_items(self, 'HELMET')
+
+
+def _export_target_get(operator, domain):
+    target = getattr(operator, 'body_target' if domain == 'BODY' else 'helmet_target')
+    return next((row[3] for row in _export_target_items(operator, domain) if row[0] == target), 0)
+
+
+def _export_target_set(operator, domain, value):
+    target = next((row[0] for row in _export_target_items(operator, domain) if row[3] == value), '')
+    setattr(operator, 'body_target' if domain == 'BODY' else 'helmet_target',
+            '' if target == '__SELECT__' else target)
+
+
+def _export_body_get(self):
+    return _export_target_get(self, 'BODY')
+
+
+def _export_body_set(self, value):
+    _export_target_set(self, 'BODY', value)
+
+
+def _export_helmet_get(self):
+    return _export_target_get(self, 'HELMET')
+
+
+def _export_helmet_set(self, value):
+    _export_target_set(self, 'HELMET', value)
 
 
 def _independent_package_filepath(filepath):
@@ -2377,7 +2437,7 @@ class HD2PB_OT_export_v1(Operator, ExportHelper):
     bl_idname = "hd2pb.export_v1"
     bl_label = "导出物理与姿态 / 更新独立配套包"
     bl_description = (
-        "AQSDK 独立模式按最近保存的身体/头盔目标更新物理与衣物姿态配套 ZIP；身体共享规范资源，头盔独立；"
+        "选择身体、头盔或两者，AQSDK 自动读取已保存 Patch 并更新物理与衣物姿态配套 ZIP，无需切换激活项；"
         "模型或骨架变化需先重新保存；Unit 与骨骼槽位全部自动解析，不支持手动映射直出"
     )
     bl_options = {"REGISTER"}
@@ -2400,7 +2460,57 @@ class HD2PB_OT_export_v1(Operator, ExportHelper):
         description="打开文件选择器时记录的物理骨项目身份；执行时必须仍与所属骨架一致",
         options={"HIDDEN"},
     )
-    export_domain: StringProperty(name="导出身体或头盔域", description="记录打开文件选择器时的独立保存域，防止中途切换", options={"HIDDEN"})
+    content_domain: EnumProperty(
+        name="更新范围",
+        description="选择要更新的配套包；身体与头盔分别使用各自已保存的模型与 Patch",
+        items=(('BODY', '身体', '只更新身体配套包'),
+               ('HELMET', '头盔', '只更新头盔配套包'),
+               ('BOTH', '身体＋头盔', '一次导出身体与头盔两个配套包')),
+        default='BOTH',
+    )
+    target_snapshot: StringProperty(name="已保存目标快照", options={"HIDDEN", "SKIP_SAVE"})
+    body_target: StringProperty(name="身体保存目标身份", options={"HIDDEN", "SKIP_SAVE"})
+    helmet_target: StringProperty(name="头盔保存目标身份", options={"HIDDEN", "SKIP_SAVE"})
+    body_target_choice: EnumProperty(
+        name="身体目标", items=_export_body_items, get=_export_body_get, set=_export_body_set,
+    )
+    helmet_target_choice: EnumProperty(
+        name="头盔目标", items=_export_helmet_items, get=_export_helmet_get, set=_export_helmet_set,
+    )
+    body_patch_path: StringProperty(
+        name="身体 Patch 位置",
+        description="通常留空自动查找；找不到或文件搬家时指定已保存的 .patch_N 或模型 .zip，无需重新保存模型",
+        subtype='FILE_PATH', options={'SKIP_SAVE'},
+    )
+    helmet_patch_path: StringProperty(
+        name="头盔 Patch 位置",
+        description="通常留空自动查找；找不到或文件搬家时指定已保存的 .patch_N 或模型 .zip，无需重新保存模型",
+        subtype='FILE_PATH', options={'SKIP_SAVE'},
+    )
+
+    def draw(self, _context):
+        layout = self.layout
+        layout.prop(self, 'content_domain')
+        for domain, title, field in (('BODY', '身体', 'body_target_choice'),
+                                     ('HELMET', '头盔', 'helmet_target_choice')):
+            if self.content_domain not in (domain, 'BOTH'):
+                continue
+            box = layout.box()
+            box.label(text=f"{title}已保存目标")
+            box.prop(self, field, text="")
+            box.prop(self, 'body_patch_path' if domain == 'BODY' else 'helmet_patch_path')
+            if not _export_target_records(self, domain):
+                box.label(text=f"找不到{title}保存记录", icon='ERROR')
+                box.label(text="请先用 AQSDK 保存该部位")
+        layout.label(text="自动读取对应 Patch，无需切换激活项", icon='INFO')
+        layout.label(text="Patch 位置通常留空；找不到时指定")
+        layout.label(text="已有 .patch_N 或模型 .zip 即可")
+        if self.content_domain == 'BOTH':
+            box = layout.box()
+            box.label(text="文件名用作两个包的共同前缀")
+            box.label(text="<文件名>_身体.hd2irpack.zip")
+            box.label(text="<文件名>_头盔.hd2irpack.zip")
+            box.label(text="两侧校验通过后一起写出")
 
     def check(self, _context):
         # ExportHelper.check 会先删除最后一个扩展名，导致复合扩展名无限叠加。
@@ -2438,8 +2548,9 @@ class HD2PB_OT_export_v1(Operator, ExportHelper):
         if len(matches) != 1:
             raise ownership.HD2PBError('独立配套更新需要当前面板所属的 AQSDK 处于启用状态；请启用配套 SDK 后重启 Blender')
         sdk = matches[0]
-        if not callable(getattr(sdk, 'export_independent_physics_update', None)):
-            raise ownership.HD2PBError('当前 AQSDK 不支持独立配套更新，请一起安装本轮配套版本')
+        if not all(callable(getattr(sdk, name, None)) for name in (
+                'list_independent_physics_update_targets', 'export_independent_physics_updates')):
+            raise ownership.HD2PBError('当前 AQSDK 不支持批量独立配套更新，请更新到本轮配套 SDK 后重试')
         return sdk
 
     @classmethod
@@ -2464,12 +2575,53 @@ class HD2PB_OT_export_v1(Operator, ExportHelper):
             self.owner_name = owner.name
             self.project_uuid = project.project_uuid
             sdk = self._independent_backend(context)
-            summary = _export_independent_update(sdk, context, owner)
-            self.export_domain = summary['content_domain']
-            self.filepath = summary['default_name']
+            self.target_snapshot = ''
+            self._prepare_targets(sdk, context, owner)
+            if not self.filepath:
+                self.filepath = bpy.path.clean_name(owner.name) + '_物理配套.hd2irpack.zip'
             return ExportHelper.invoke(self, context, event)
         except Exception as exc:
             return _cancel(self, exc)
+
+    def _prepare_targets(self, sdk, context, owner):
+        if self.target_snapshot:
+            return
+        try:
+            records = sdk.list_independent_physics_update_targets(context, owner)
+        except sdk.PhysicsPackagingError as exc:
+            raise ownership.HD2PBError(str(exc)) from exc
+        self.target_snapshot = json.dumps(records, ensure_ascii=False)
+        for domain, field in (('BODY', 'body_target'), ('HELMET', 'helmet_target')):
+            candidates = _export_target_records(self, domain)
+            if not getattr(self, field) and len(candidates) == 1:
+                setattr(self, field, candidates[0]['target_id'])
+
+    def _selected_targets(self):
+        for domain, title, field in (('BODY', '身体', 'body_target'),
+                                     ('HELMET', '头盔', 'helmet_target')):
+            if self.content_domain not in (domain, 'BOTH'):
+                continue
+            records = _export_target_records(self, domain)
+            if not records:
+                raise ownership.HD2PBError(
+                    f'找不到{title}保存记录；请先用 AQSDK 保存该部位，或仅选择已有记录的更新范围。'
+                    '加载 Patch 不会自动恢复工程中的保存记录'
+                )
+            target = getattr(self, field)
+            if not target:
+                if len(records) > 1:
+                    raise ownership.HD2PBError(f'{title}有多个已保存目标，请在导出窗口中明确选择 Archive / Patch')
+                raise ownership.HD2PBError(f'尚未选择{title}保存目标，请在导出窗口中选择 Archive / Patch')
+            if target not in {record['target_id'] for record in records}:
+                raise ownership.HD2PBError(f'{title}保存目标已失效，请重新打开导出窗口选择目标')
+        return {
+            'content_domain': self.content_domain,
+            'body_target': self.body_target, 'helmet_target': self.helmet_target,
+            'body_patch_path': bpy.path.abspath(self.body_patch_path)
+            if self.content_domain in ('BODY', 'BOTH') and self.body_patch_path else '',
+            'helmet_patch_path': bpy.path.abspath(self.helmet_patch_path)
+            if self.content_domain in ('HELMET', 'BOTH') and self.helmet_patch_path else '',
+        }
 
     def _resolve_export_owner(self):
         if not self.owner_name or not self.project_uuid:
@@ -2497,14 +2649,14 @@ class HD2PB_OT_export_v1(Operator, ExportHelper):
                 self.project_uuid = project.project_uuid
             owner = self._resolve_export_owner()
             sdk = self._independent_backend(context)
-            summary = _export_independent_update(sdk, context, owner)
-            if self.export_domain and self.export_domain != summary['content_domain']:
-                raise ownership.HD2PBError('打开导出窗口后身体/头盔保存范围已改变，请重新打开导出窗口')
+            self._prepare_targets(sdk, context, owner)
+            targets = self._selected_targets()
+            _export_independent_update(sdk, context, owner, **targets)
             self.check(context)
-            summary = _export_independent_update(sdk, context, owner, self.filepath)
-            self.report({'INFO'}, f"已导出{summary['domain_name']}物理配套更新包："
+            summary = _export_independent_update(sdk, context, owner, self.filepath, **targets)
+            domains = '＋'.join(target['domain_name'] for target in summary['targets'])
+            self.report({'INFO'}, f"已导出{domains}物理配套更新包（{len(summary['outputs'])} 个）："
                         f"{summary['units']} 个 Unit / {summary['chains']} 条链"
-                        + (f" / {summary['physics_files']} 个总物理文件" if summary.get('solver_scope') == 'shared_body_v2' else '')
                         + "；未重写模型或材质")
             return {'FINISHED'}
         except Exception as exc:

@@ -20,6 +20,12 @@ def consumer_bones(owner):
         animation = getattr(obj, 'animation_data', None)
         if animation and animation.drivers:
             return None
+        # Shape drivers belong to the Key datablock. Even an unbound mesh can
+        # read a physics bone, so inspect them before the armature-user filter.
+        keys = getattr(getattr(obj, 'data', None), 'shape_keys', None)
+        animation = getattr(keys, 'animation_data', None)
+        if animation and animation.drivers:
+            return None
         if obj.parent == owner and obj.parent_type == 'BONE':
             result.add(obj.parent_bone)
         for constraint in obj.constraints:
